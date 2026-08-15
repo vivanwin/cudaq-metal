@@ -45,26 +45,37 @@ def _cudaq_plugin_dirs() -> tuple[str, str]:
     return lib_dir, targets_dir
 
 
-def _check_platform_and_version() -> None:
+def _require_platform() -> None:
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise RuntimeError(
             "cudaq-metal only supports Apple Silicon macOS (arm64). "
             f"Detected {platform.system()}/{platform.machine()}."
         )
-    try:
-        import cudaq  # noqa: F401
 
-        ver = getattr(cudaq, "__version__", "")
-        # cudaq.__version__ looks like "CUDA-Q Version 0.15.0 (...)"
-        if not any(v in ver for v in COMPATIBLE_CUDAQ):
+
+def _warn_if_version_mismatch() -> None:
+    # IMPORTANT: read the version via importlib.metadata, NOT by `import cudaq`.
+    # Importing cudaq here would make it scan (and cache) its target list before
+    # we have copied metal.yml — leaving `set_target("metal")` invalid.
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        ver = ""
+        for dist in ("cudaq", "cuda-quantum"):
+            try:
+                ver = version(dist)
+                break
+            except PackageNotFoundError:
+                continue
+        if ver and not any(ver.startswith(v) for v in COMPATIBLE_CUDAQ):
             warnings.warn(
                 f"cudaq-metal was built for CUDA-Q {COMPATIBLE_CUDAQ}, but this "
-                f"environment reports '{ver}'. The Metal backend may fail to "
+                f"environment has cudaq {ver}. The Metal backend may fail to "
                 "load; rebuild it against your CUDA-Q if so.",
                 stacklevel=2,
             )
     except Exception:
-        pass  # importing cudaq is not required just to install the files
+        pass
 
 
 def install(force: bool = False, quiet: bool = True) -> tuple[str, str]:
@@ -73,8 +84,10 @@ def install(force: bool = False, quiet: bool = True) -> tuple[str, str]:
     Returns the (dylib, yml) destination paths. Set ``force=True`` to overwrite
     an existing install (e.g. after upgrading this package).
     """
-    _check_platform_and_version()
-    lib_dir, targets_dir = _cudaq_plugin_dirs()
+    _require_platform()
+    # Copy the plugin BEFORE anything might import cudaq, so cudaq sees
+    # metal.yml when it first scans its targets directory.
+    lib_dir, targets_dir = _cudaq_plugin_dirs()  # find_spec: does not import cudaq
     data = _data_dir()
     src_dylib = os.path.join(data, "libnvqir-metal.dylib")
     src_yml = os.path.join(data, "metal.yml")
@@ -88,6 +101,7 @@ def install(force: bool = False, quiet: bool = True) -> tuple[str, str]:
                 os.chmod(dst, 0o755)
             if not quiet:
                 print(f"cudaq-metal: installed {dst}")
+    _warn_if_version_mismatch()  # after copying, so cudaq's scan already sees us
     return dst_dylib, dst_yml
 
 
