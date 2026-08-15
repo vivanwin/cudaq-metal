@@ -71,13 +71,15 @@ bash scripts/install_into_venv.sh  # copies the backend into the Python cudaq
 
 ## Use it in another project (pip — recommended)
 
-The Metal backend ships as a small pip package that drops the prebuilt plugin
-into whatever CUDA-Q a project uses (see [packaging/](packaging/)):
+The Metal backend ships as a small pip package (the repo root is the package)
+that drops the prebuilt plugin into whatever CUDA-Q a project uses:
 
 ```bash
 pip install cudaq==0.15.0
-pip install packaging/dist/cudaq_metal-0.1.0-py3-none-any.whl   # or: pip install ./packaging
+pip install "git+https://github.com/<you>/<repo>.git"
 ```
+
+Or from a local checkout: `pip install .`  (or a prebuilt wheel under `dist/`).
 
 ```python
 import cudaq_metal      # installs the backend into this env's cudaq (idempotent)
@@ -85,8 +87,9 @@ import cudaq
 cudaq.set_target("metal")
 ```
 
-The shipped binary is ABI-matched to CUDA-Q 0.15.x. After changing the C++
-sources, regenerate it with `bash packaging/refresh_binary.sh`.
+The shipped binary (`cudaq_metal/data/libnvqir-metal.dylib`) is ABI-matched to
+CUDA-Q 0.15.x. After changing the C++ sources, regenerate + repackage it with
+`bash scripts/refresh_binary.sh` and commit `cudaq_metal/data/`.
 
 ## Use it (development install)
 

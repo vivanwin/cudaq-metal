@@ -22,9 +22,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
-/packaging/build/
-/packaging/dist/
-/packaging/src/*.egg-info/
+/dist/
 
 # macOS
 .DS_Store

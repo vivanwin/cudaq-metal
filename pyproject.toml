@@ -26,11 +26,9 @@ cudaq-metal-install = "cudaq_metal._install:_main"
 [project.urls]
 Homepage = "https://github.com/NVIDIA/cuda-quantum"
 
-[tool.setuptools]
-package-dir = { "" = "src" }
-
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["cudaq_metal*"]
 
 [tool.setuptools.package-data]
 cudaq_metal = ["data/*.dylib", "data/*.yml"]
