@@ -1,0 +1,39 @@
+# CUDA-Q C++ toolkit / installer (large third-party binaries, not source)
+/toolchain/
+
+# CMake / build outputs
+/build/
+*.o
+
+# nvq++ / compiled demo binaries (generated in-tree)
+build_ghz_qpp
+build_ghz_metal
+build_bench_qpp
+build_bench_metal
+build_standalone_bench
+*.qke
+*.qke.o
+*.classic.o
+*.qir.ll
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+/packaging/build/
+/packaging/dist/
+/packaging/src/*.egg-info/
+
+# macOS
+.DS_Store
+
+# Editor / harness / stray temporaries
+.claude/
+*.tmp
+*.ll.tmp
+
+# NOTE: packaging/src/cudaq_metal/data/libnvqir-metal.dylib IS committed on
+# purpose — it is the shipped, prebuilt backend. Refresh it with
+# packaging/refresh_binary.sh after changing the C++ sources.

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cudaq-metal"
+version = "0.1.0"
+description = "Naive Metal (Apple GPU) statevector backend for NVIDIA CUDA-Q on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Vincent" }]
+keywords = ["cudaq", "quantum", "simulator", "metal", "apple-silicon"]
+classifiers = [
+    "Environment :: GPU",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
+# cudaq is an expected peer dependency but intentionally NOT pinned here so this
+# package can install into an environment that already has a matching cudaq.
+# The bundled binary is ABI-matched to cudaq 0.15.x (see cudaq_metal._install).
+
+[project.scripts]
+cudaq-metal-install = "cudaq_metal._install:_main"
+
+[project.urls]
+Homepage = "https://github.com/NVIDIA/cuda-quantum"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cudaq_metal = ["data/*.dylib", "data/*.yml"]
