@@ -13,8 +13,9 @@ the ``cudaq-metal-install`` console command.
 """
 from ._install import install, is_installed
 from ._reset import reset, observe, sample
+from ._reliable import ReliableObserver, WorkerRestartLimitExceeded
 
-__all__ = ["install", "is_installed", "reset", "observe", "sample"]
+__all__ = ["install", "is_installed", "reset", "observe", "sample", "ReliableObserver", "WorkerRestartLimitExceeded"]
 
 # Auto-install on import so `cudaq.set_target("metal")` just works. Kept
 # best-effort: a failure here (e.g. cudaq not yet installed) is a warning, not

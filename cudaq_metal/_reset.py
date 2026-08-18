@@ -67,23 +67,19 @@ def reset() -> bool:
 # looks legitimate. This wrapper does that around cudaq.observe and cudaq.sample.
 
 def _looks_like_zero_state(result) -> bool:
-    """Detect the silent-|0..0> outcome. Both observe and sample results supported."""
-    # observe_result: expectation() close to zero AND the underlying sample map
-    # concentrates on the all-zeros string (this is the tell — the untouched
-    # state gives exactly 0 for any Hamiltonian without an identity offset,
-    # and the sampling would show 100% |0..0>).
+    """Detect the silent-|0..0> outcome in an observe_result.
+
+    A healthy observe against a zero-diagonal Hamiltonian (the standard case
+    after identity offset) returns some non-zero expectation. The untouched
+    |0..0> state gives EXACTLY 0.0. That's the unambiguous retry signal.
+
+    IMPORTANT: sample_result also has .expectation(), but for a peaked
+    distribution it can legitimately be near-zero. Use this on observe results
+    only — the wrapper `sample()` deliberately skips this check.
+    """
     try:
-        expv = result.expectation()
-        return abs(expv) < 1e-12  # untouched state gives EXACTLY 0
+        return abs(result.expectation()) < 1e-12
     except AttributeError:
-        pass
-    # sample_result: check that the only nonzero count is the |0..0> string
-    try:
-        d = {k: v for k, v in result.items()}
-        total = sum(d.values())
-        zeros_key = "0" * max(len(k) for k in d)
-        return total > 0 and d.get(zeros_key, 0) == total
-    except Exception:
         return False
 
 
@@ -102,12 +98,14 @@ def observe(kernel, hamiltonian, *args, max_retries: int = 20):
 
 
 def sample(kernel, *args, max_retries: int = 20, **kwargs):
-    """cudaq.sample wrapped in reset+retry-on-failure. Darwin arm64 workaround."""
+    """cudaq.sample with a reset() call. Retry-detection is unsafe for sample:
+    a peaked healthy distribution can concentrate on |0..0> too, and there is
+    no cheap way to distinguish that from the deferred-exception failure. So
+    we clear any lingering deferred state and pass through.
+
+    For robust sample-based work, use `ReliableObserver.sample` — its worker
+    restarts on observe-driven failures, indirectly protecting sample too.
+    """
     import cudaq
-    for attempt in range(max_retries + 1):
-        reset()
-        r = cudaq.sample(kernel, *args, **kwargs)
-        if not _looks_like_zero_state(r):
-            return r
-    raise RuntimeError(
-        f"cudaq_metal.sample: gave up after {max_retries+1} attempts.")
+    reset()
+    return cudaq.sample(kernel, *args, **kwargs)
