@@ -130,7 +130,6 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
     if (n <= 0)
       return;
     if (!engine) {
-      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] no engine -> msv_create(%d)\n", n);
       engine = msv_create(n);
       if (!engine)
         throw std::runtime_error("[metal] failed to create Metal simulator "
@@ -138,12 +137,9 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
       return;
     }
     int cur = msv_num_qubits(engine);
-    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] requested n=%d, cur=%d\n", n, cur);
     if (n > cur) {
-      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] GROW %d -> %d\n", cur, n);
       msv_grow_to(engine, n);
     } else if (n < cur) {
-      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] *** DESTRUCTIVE SHRINK %d -> %d (STATE WIPED) ***\n", cur, n);
       msv_destroy(engine);
       engine = msv_create(n);
     }
@@ -315,8 +311,7 @@ protected:
   /// by the base class to reflect the new total qubit count.
   void addQubitsToState(std::size_t qubitCount,
                         const void *stateDataIn = nullptr) override {
-    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG addQubitsToState] qubitCount=%zu, stateDimension=%zu, hasStateDataIn=%d\n",
-            qubitCount, stateDimension, stateDataIn != nullptr);
+
     if (qubitCount == 0)
       return;
     const int newN = numQubitsFromDim();
@@ -340,7 +335,6 @@ protected:
 
   /// @brief Free the device state.
   void deallocateStateImpl() override {
-    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG deallocateStateImpl] called\n");
     discardGroup();
     if (engine) {
       msv_destroy(engine);
@@ -352,10 +346,6 @@ protected:
   /// controls) are supported so far — enough for H/X/Z/rotations and
   /// (multi-)controlled-X/Z, i.e. GHZ and most textbook circuits.
   int gateCount_ = 0;
-  static bool msvDebugEnabled() {
-    static const bool on = std::getenv("MSV_DEBUG") != nullptr;
-    return on;
-  }
 
   // Defensive check: cudaq's `deferOrThrowKernelException` stashes JIT-frame
   // exceptions on the ExecutionContext because a C++ exception cannot unwind
@@ -413,8 +403,6 @@ protected:
       for (auto t : task.targets) tgts += std::to_string(t) + ",";
       std::string ctrls;
       for (auto c : task.controls) ctrls += std::to_string(c) + ",";
-      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG applyGate #%d] op=%s targets=[%s] controls=[%s]\n",
-              gateCount_, task.operationName.c_str(), tgts.c_str(), ctrls.c_str());
     }
     if (nT < 1 || nT > 4)
       throw std::runtime_error(
@@ -464,7 +452,6 @@ protected:
 
   /// @brief Reset the current state back to |0...0>.
   void setToZeroState() override {
-    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG setToZeroState] called, numQubitsFromDim=%d\n", numQubitsFromDim());
     discardGroup();
     const int n = numQubitsFromDim();
     if (n == 0) {
@@ -542,10 +529,6 @@ public:
         totalNorm += n;
         if (n > 1e-12) ++nonzeroCount;
       }
-      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG sample] dim=%zu, engine_qubits=%d, qubits.size()=%zu, "
-              "totalNorm=%.6f, nonzeroAmplitudes=%d, amp[0]=(%.4f,%.4f)\n",
-              dim, engine ? msv_num_qubits(engine) : -1, qubits.size(), totalNorm,
-              nonzeroCount, amp[0].real(), amp[0].imag());
     }
 
     // Expectation-value path (used by observe when no shots).
@@ -621,6 +604,18 @@ public:
 };
 
 } // namespace nvqir
+
+/// Exported C helper: clear cudaq's deferredKernelException from Python.
+/// Python is always outside a JIT launch frame, so this is safe.
+/// Returns 1 if it cleared something, 0 otherwise.
+extern "C" int metal_clear_deferred_kernel_exception() {
+  auto *ctx = cudaq::getExecutionContext();
+  if (ctx && ctx->deferredKernelException) {
+    ctx->deferredKernelException = nullptr;
+    return 1;
+  }
+  return 0;
+}
 
 /// Register this simulator with NVQIR under the name "metal".
 NVQIR_REGISTER_SIMULATOR(nvqir::MetalCircuitSimulator, metal)

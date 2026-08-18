@@ -12,8 +12,9 @@ also install/refresh it explicitly with ``cudaq_metal.install(force=True)`` or
 the ``cudaq-metal-install`` console command.
 """
 from ._install import install, is_installed
+from ._reset import reset, observe, sample
 
-__all__ = ["install", "is_installed"]
+__all__ = ["install", "is_installed", "reset", "observe", "sample"]
 
 # Auto-install on import so `cudaq.set_target("metal")` just works. Kept
 # best-effort: a failure here (e.g. cudaq not yet installed) is a warning, not
