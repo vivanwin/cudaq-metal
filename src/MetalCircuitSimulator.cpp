@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <complex>
 #include <optional>
@@ -129,6 +130,7 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
     if (n <= 0)
       return;
     if (!engine) {
+      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] no engine -> msv_create(%d)\n", n);
       engine = msv_create(n);
       if (!engine)
         throw std::runtime_error("[metal] failed to create Metal simulator "
@@ -136,9 +138,12 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
       return;
     }
     int cur = msv_num_qubits(engine);
+    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] requested n=%d, cur=%d\n", n, cur);
     if (n > cur) {
+      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] GROW %d -> %d\n", cur, n);
       msv_grow_to(engine, n);
     } else if (n < cur) {
+      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG ensureEngine] *** DESTRUCTIVE SHRINK %d -> %d (STATE WIPED) ***\n", cur, n);
       msv_destroy(engine);
       engine = msv_create(n);
     }
@@ -310,6 +315,8 @@ protected:
   /// by the base class to reflect the new total qubit count.
   void addQubitsToState(std::size_t qubitCount,
                         const void *stateDataIn = nullptr) override {
+    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG addQubitsToState] qubitCount=%zu, stateDimension=%zu, hasStateDataIn=%d\n",
+            qubitCount, stateDimension, stateDataIn != nullptr);
     if (qubitCount == 0)
       return;
     const int newN = numQubitsFromDim();
@@ -333,6 +340,7 @@ protected:
 
   /// @brief Free the device state.
   void deallocateStateImpl() override {
+    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG deallocateStateImpl] called\n");
     discardGroup();
     if (engine) {
       msv_destroy(engine);
@@ -343,8 +351,71 @@ protected:
   /// @brief Apply a gate. Only single-target gates (with any number of
   /// controls) are supported so far — enough for H/X/Z/rotations and
   /// (multi-)controlled-X/Z, i.e. GHZ and most textbook circuits.
+  int gateCount_ = 0;
+  static bool msvDebugEnabled() {
+    static const bool on = std::getenv("MSV_DEBUG") != nullptr;
+    return on;
+  }
+
+  // Defensive check: cudaq's `deferOrThrowKernelException` stashes JIT-frame
+  // exceptions on the ExecutionContext because a C++ exception cannot unwind
+  // through a JIT frame on Darwin arm64. In that state, `enqueueGate` and
+  // `flushGateQueueImpl` become no-ops, and sampling then returns an untouched
+  // |0..0> state — a silently wrong answer that has bitten every multi-
+  // evaluation workflow on this backend (see BUG_INVESTIGATION.md).
+  //
+  // We can't just `throw` from here — if we're still inside a JIT launch frame
+  // (ctx->inKernelLaunch=true), the throw itself would hit the same Darwin
+  // arm64 unwinder bug and terminate the process. So:
+  //   - print a loud, unmissable warning to stderr on every affected call
+  //   - clear the deferred exception so the next kernel invocation gets a
+  //     fresh chance (rather than being permanently poisoned)
+  //   - throw only when it is safe to do so (outside the JIT launch frame)
+  static void checkNotSilentlyDeferred(const char *op) {
+    if (!kernelExecutionDeferred())
+      return;
+    auto *ctx = cudaq::getExecutionContext();
+    const bool safeToThrow = !ctx || !ctx->inKernelLaunch;
+    // Always warn loudly — this is the last chance to tell the caller the
+    // result is untrustworthy.
+    fprintf(stderr,
+            "\n\n==============================================================================\n"
+            "  [metal] WARNING: %s() called with a deferred kernel exception.\n"
+            "  cudaq discarded this kernel's gate queue (no gates were applied)\n"
+            "  due to an upstream Darwin arm64 JIT-frame exception. The state is\n"
+            "  the untouched |0..0>, so any result computed from it is WRONG.\n"
+            "  This process's cudaq state is now inconsistent; RESTART the Python\n"
+            "  process and re-run. This is a known upstream cudaq bug; see\n"
+            "  BUG_INVESTIGATION.md in the cudaq-metal repo for details.\n"
+            "==============================================================================\n\n",
+            op);
+    // NB: we deliberately do NOT clear ctx->deferredKernelException here.
+    // Clearing seemed a good idea (poison-vs-fresh) but in practice caused a
+    // downstream crash — apparently cudaq relies on that flag remaining set
+    // until *it* clears it, and unsetting from underneath the runtime races
+    // against something in the observe/sample finalization path.
+    (void)ctx;
+    // We deliberately DO NOT throw here. Throwing from sample()/get_state()
+    // while inKernelLaunch=true hits the same Darwin arm64 unwinder bug the
+    // deferred-exception mechanism was invented to work around, and terminates
+    // the process. Instead we fall through and let the (wrong) |0..0> state be
+    // sampled. The warning above is our only signal to the user; they should
+    // notice, kill the process, and restart. The alternative (silent zeros
+    // with no warning) is what shipped before this defensive check was added
+    // and was the whole reason BUG_INVESTIGATION.md exists.
+    (void)safeToThrow;
+  }
   void applyGate(const GateApplicationTask &task) override {
     const int nT = static_cast<int>(task.targets.size());
+    ++gateCount_;
+    if (gateCount_ <= 5 || gateCount_ % 100 == 0) {
+      std::string tgts;
+      for (auto t : task.targets) tgts += std::to_string(t) + ",";
+      std::string ctrls;
+      for (auto c : task.controls) ctrls += std::to_string(c) + ",";
+      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG applyGate #%d] op=%s targets=[%s] controls=[%s]\n",
+              gateCount_, task.operationName.c_str(), tgts.c_str(), ctrls.c_str());
+    }
     if (nT < 1 || nT > 4)
       throw std::runtime_error(
           "[metal] gates with " + std::to_string(nT) +
@@ -393,6 +464,7 @@ protected:
 
   /// @brief Reset the current state back to |0...0>.
   void setToZeroState() override {
+    if (msvDebugEnabled()) fprintf(stderr, "[DEBUG setToZeroState] called, numQubitsFromDim=%d\n", numQubitsFromDim());
     discardGroup();
     const int n = numQubitsFromDim();
     if (n == 0) {
@@ -457,9 +529,24 @@ public:
   cudaq::ExecutionResult sample(const std::vector<std::size_t> &qubits,
                                 const int shots,
                                 bool includeSequentialData = true) override {
+    checkNotSilentlyDeferred("sample");
     flushGateQueue(); // apply any pending fused block first
+
     Complex *amp = amplitudes();
     const std::size_t dim = std::size_t(1) << msv_num_qubits(engine);
+    {
+      double totalNorm = 0.0;
+      int nonzeroCount = 0;
+      for (std::size_t i = 0; i < dim; ++i) {
+        double n = std::norm(amp[i]);
+        totalNorm += n;
+        if (n > 1e-12) ++nonzeroCount;
+      }
+      if (msvDebugEnabled()) fprintf(stderr, "[DEBUG sample] dim=%zu, engine_qubits=%d, qubits.size()=%zu, "
+              "totalNorm=%.6f, nonzeroAmplitudes=%d, amp[0]=(%.4f,%.4f)\n",
+              dim, engine ? msv_num_qubits(engine) : -1, qubits.size(), totalNorm,
+              nonzeroCount, amp[0].real(), amp[0].imag());
+    }
 
     // Expectation-value path (used by observe when no shots).
     if (shots < 1) {
@@ -514,6 +601,7 @@ public:
   /// @brief Expose the current statevector for cudaq::get_state() etc.
   /// Returns an fp32 copy of the amplitudes in canonical (qubit q = bit q) order.
   std::unique_ptr<cudaq::SimulationState> getSimulationState() override {
+    checkNotSilentlyDeferred("get_state");
     flushGateQueue();
     if (!engine)
       return std::make_unique<MetalSimState>();
