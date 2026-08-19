@@ -83,12 +83,12 @@ def _looks_like_zero_state(result) -> bool:
         return False
 
 
-def observe(kernel, hamiltonian, *args, max_retries: int = 20):
+def observe(kernel, hamiltonian, *args, max_retries: int = 20, **kwargs):
     """cudaq.observe wrapped in reset+retry-on-failure. Darwin arm64 workaround."""
     import cudaq
     for attempt in range(max_retries + 1):
         reset()
-        r = cudaq.observe(kernel, hamiltonian, *args)
+        r = cudaq.observe(kernel, hamiltonian, *args, **kwargs)
         if not _looks_like_zero_state(r):
             return r
     raise RuntimeError(

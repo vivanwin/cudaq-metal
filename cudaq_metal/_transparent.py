@@ -51,13 +51,39 @@ _kernel_finalizers: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary(
 
 
 class ObserveProxy:
-    """Minimal stand-in for cudaq's observe_result — carries only .expectation()."""
+    """Full stand-in for cudaq's observe_result: ``.expectation()``, ``.counts()``,
+    ``.get_spin()``, ``.dump()``. The worker sends back the expectation value
+    (float) and the raw ``SampleResult.serialize()`` list; we rebuild a real
+    ``SampleResult`` on the parent side. The spin operator is the one the caller
+    supplied — we already have it, no need to ship it back.
+    """
 
-    def __init__(self, expectation_value: float) -> None:
+    def __init__(self, expectation_value: float,
+                 counts_data: list | None,
+                 spin_op) -> None:
         self._expv = float(expectation_value)
+        self._counts_data = counts_data
+        self._counts_cached = None
+        self._spin_op = spin_op
 
     def expectation(self) -> float:
         return self._expv
+
+    def counts(self):
+        if self._counts_cached is not None:
+            return self._counts_cached
+        from cudaq import SampleResult
+        sr = SampleResult()
+        if self._counts_data is not None:
+            sr.deserialize(list(self._counts_data))
+        self._counts_cached = sr
+        return sr
+
+    def get_spin(self):
+        return self._spin_op
+
+    def dump(self) -> None:
+        print(self)
 
     def __repr__(self) -> str:
         return f"ObserveProxy(expectation={self._expv:+.6f})"
@@ -118,8 +144,20 @@ for line in sys.stdin:
     args = msg.get("args", [])
     try:
         if op == "observe":
-            r = cudaq_metal.observe(kernel, H, *args, max_retries=max_retries)
-            sys.stdout.write(json.dumps({"status": "ok", "expectation": r.expectation()}) + "\n")
+            shots = msg.get("shots_count", 0)
+            kwargs = {"shots_count": shots} if shots else {}
+            r = cudaq_metal.observe(kernel, H, *args, max_retries=max_retries, **kwargs)
+            counts_data = None
+            try:
+                sr = r.counts()
+                counts_data = list(sr.serialize())
+            except Exception:
+                pass  # older cudaq / analytical path: no counts
+            sys.stdout.write(json.dumps({
+                "status": "ok",
+                "expectation": r.expectation(),
+                "counts_data": counts_data,
+            }) + "\n")
             sys.stdout.flush()
         elif op == "quit":
             break
@@ -193,7 +231,7 @@ class _TransparentWorkerPool:
         # Cheap identity: id() of qprog + id() of H. If either changes, refresh.
         return (id(qprog), id(H))
 
-    def observe(self, qprog, H, *args) -> float:
+    def observe(self, qprog, H, *args, shots_count: int = 0):
         key = self._key_for(qprog, H)
         while True:
             if self._proc is not None and self._proc.poll() is not None:
@@ -208,7 +246,10 @@ class _TransparentWorkerPool:
                 self._start(qprog, H)
                 self._key = key
             try:
-                self._proc.stdin.write((json.dumps({"op": "observe", "args": list(args)}) + "\n").encode())
+                payload = {"op": "observe", "args": list(args)}
+                if shots_count:
+                    payload["shots_count"] = shots_count
+                self._proc.stdin.write((json.dumps(payload) + "\n").encode())
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._kill()
@@ -223,7 +264,10 @@ class _TransparentWorkerPool:
                 continue
             if resp.get("status") != "ok":
                 raise RuntimeError(f"[cudaq_metal] worker returned {resp}")
-            return float(resp["expectation"])
+            return {
+                "expectation": float(resp["expectation"]),
+                "counts_data": resp.get("counts_data"),
+            }
 
     def close(self) -> None:
         self._kill()
@@ -284,8 +328,12 @@ def _patched_observe(kernel, hamiltonian, *args, **kwargs):
     if qprog is None:
         # Not a tracked kernel; fall back to plain cudaq.observe.
         return _original_observe(kernel, hamiltonian, *args, **kwargs)
-    expv = _get_pool().observe(qprog, hamiltonian, *args)
-    return ObserveProxy(expv)
+    shots_count = int(kwargs.pop("shots_count", 0))
+    if kwargs:
+        # unknown kwargs — safest to fall back rather than silently ignore
+        return _original_observe(kernel, hamiltonian, *args, **kwargs)
+    resp = _get_pool().observe(qprog, hamiltonian, *args, shots_count=shots_count)
+    return ObserveProxy(resp["expectation"], resp["counts_data"], hamiltonian)
 
 
 def enable_transparent() -> None:
