@@ -146,6 +146,9 @@ class _TransparentWorkerPool:
         import os
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Prevent the worker from auto-enabling transparent mode (would recurse
+        # into another subprocess spawn on every observe call).
+        env["_CUDAQ_METAL_WORKER"] = "1"
         script_path = os.path.join(os.path.dirname(__file__), "_worker_transparent.py")
         if not os.path.exists(script_path):
             with open(script_path, "w") as f:

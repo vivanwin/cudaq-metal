@@ -142,6 +142,7 @@ class ReliableObserver:
         env = os.environ.copy()
         # Keep worker output line-buffered so we can readline in the parent.
         env["PYTHONUNBUFFERED"] = "1"
+        env["_CUDAQ_METAL_WORKER"] = "1"
         # Merge extras into PYTHONPATH so the worker can import build_module
         # from wherever the caller has it (default: parent's sys.path).
         existing_pp = env.get("PYTHONPATH", "")
