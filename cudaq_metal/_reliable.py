@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import subprocess
 import sys
 from typing import Optional
@@ -33,24 +34,34 @@ from typing import Optional
 
 # The worker script we spawn. Reads (op, params) from stdin as JSON lines and
 # writes back JSON lines. Exits with code 2 on "poisoned" state (parent sees
-# EOF, decides to restart).
+# EOF, decides to restart). Setup is delivered via a length-prefixed binary
+# frame containing pickled {qprog, H_json} — no worker-side synthesize().
 _WORKER_SOURCE = r'''
-import importlib
 import json
+import pickle
+import struct
 import sys
 import cudaq
 import cudaq_metal
+from classiq import qprog_to_cudaq_kernel
+from cudaq import SpinOperator
 
-module_name = sys.argv[1]
-build_name = sys.argv[2]
-target = sys.argv[3] if len(sys.argv) > 3 else "metal"
-max_in_process_retries = int(sys.argv[4]) if len(sys.argv) > 4 else 10
+target = sys.argv[1] if len(sys.argv) > 1 else "metal"
+max_in_process_retries = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 
-mod = importlib.import_module(module_name)
-build = getattr(mod, build_name)
+# Setup: one length-prefixed binary frame with pickled {qprog, H_json}
+hdr = sys.stdin.buffer.read(4)
+if not hdr or len(hdr) < 4:
+    sys.exit("[cudaq_metal] worker: no setup frame received")
+(n,) = struct.unpack(">I", hdr)
+setup = pickle.loads(sys.stdin.buffer.read(n))
+qprog = pickle.loads(setup["qprog"])
+hamiltonian = SpinOperator.from_json(setup["H_json"]) if setup["H_json"] is not None else None
 
 cudaq.set_target(target)
-kernel, hamiltonian = build()
+kernel = qprog_to_cudaq_kernel(qprog)
+if isinstance(kernel, tuple):
+    kernel = kernel[0]
 
 print(json.dumps({"status": "ready"}), flush=True)
 
@@ -116,16 +127,36 @@ class ReliableObserver:
 
     def __init__(
         self,
-        build_module: str,
-        build_func: str = "build",
+        build_module_or_qprog=None,
+        build_func_or_hamiltonian=None,
         target: str = "metal",
         python: Optional[str] = None,
         max_in_process_retries: int = 10,
         max_worker_restarts: int = 50,
         extra_pythonpath: Optional[list] = None,
     ) -> None:
-        self.build_module = build_module
-        self.build_func = build_func
+        """Two calling patterns:
+
+        1. ``ReliableObserver(qprog, hamiltonian, ...)`` — preferred. Parent
+           synthesizes ONCE (in your own code) and passes qprog + H directly.
+           Worker restarts ship the pickled qprog; no re-synthesize.
+        2. ``ReliableObserver(build_module_name, build_func_name, ...)`` —
+           legacy. Parent imports the module and calls ``build()`` ONCE (not
+           on every restart) to extract (kernel, hamiltonian). Requires the
+           build function to use ``qprog_to_cudaq_kernel`` so we can track the
+           source qprog.
+        """
+        # Distinguish string (legacy) from qprog (preferred).
+        if isinstance(build_module_or_qprog, str):
+            self.build_module = build_module_or_qprog
+            self.build_func = build_func_or_hamiltonian or "build"
+            self._qprog = None
+            self._hamiltonian = None
+        else:
+            self.build_module = None
+            self.build_func = None
+            self._qprog = build_module_or_qprog
+            self._hamiltonian = build_func_or_hamiltonian
         self.target = target
         self.python = python or sys.executable
         self.max_in_process_retries = max_in_process_retries
@@ -135,36 +166,75 @@ class ReliableObserver:
         self._proc: Optional[subprocess.Popen] = None
         self._restart_count = 0
 
+    def _resolve_qprog_and_H(self) -> None:
+        """Lazily materialize qprog + Hamiltonian in the PARENT.
+
+        - Legacy (build_module) path: import the module and call build() ONCE
+          in the parent. Extract the source qprog from the returned kernel via
+          the tracking dict populated by the monkey-patched qprog_to_cudaq_kernel.
+        - Preferred (qprog, H) path: already resolved in __init__.
+        """
+        if self._qprog is not None:
+            return
+        if self.build_module is None:
+            raise RuntimeError("[cudaq_metal] neither qprog nor build_module provided")
+        import importlib
+        # Make sure our monkey-patch is active so we can track the qprog.
+        from . import _transparent
+        _transparent.enable_transparent()
+        # Ensure the module is importable from where the caller has it.
+        for p in reversed(self.extra_pythonpath):
+            if p and p not in sys.path:
+                sys.path.insert(0, p)
+        mod = importlib.import_module(self.build_module)
+        build = getattr(mod, self.build_func)
+        result = build()
+        if isinstance(result, tuple) and len(result) == 2:
+            kernel, hamiltonian = result
+        else:
+            raise RuntimeError(
+                f"[cudaq_metal] {self.build_func}() must return (kernel, hamiltonian); "
+                f"got {type(result).__name__}")
+        qprog = _transparent._kernel_qprog.get(id(kernel))
+        if qprog is None:
+            raise RuntimeError(
+                f"[cudaq_metal] the kernel returned by {self.build_func}() is not "
+                "tracked; build() must construct it via qprog_to_cudaq_kernel(qprog).")
+        self._qprog = qprog
+        self._hamiltonian = hamiltonian
+
     # --- worker lifecycle ---
     def _start(self) -> None:
-        # Write the worker source to a temp file so we can pass it to python
-        # cleanly (piping via -c makes stdin/stdout awkward).
+        self._resolve_qprog_and_H()
         env = os.environ.copy()
-        # Keep worker output line-buffered so we can readline in the parent.
         env["PYTHONUNBUFFERED"] = "1"
         env["_CUDAQ_METAL_WORKER"] = "1"
-        # Merge extras into PYTHONPATH so the worker can import build_module
-        # from wherever the caller has it (default: parent's sys.path).
         existing_pp = env.get("PYTHONPATH", "")
         merged = list(self.extra_pythonpath) + ([existing_pp] if existing_pp else [])
         env["PYTHONPATH"] = os.pathsep.join(p for p in merged if p)
         script_path = os.path.join(os.path.dirname(__file__), "_worker.py")
-        if not os.path.exists(script_path):
-            with open(script_path, "w") as f:
-                f.write(_WORKER_SOURCE)
+        # Force-refresh worker script whenever module version bumps — cheap.
+        with open(script_path, "w") as f:
+            f.write(_WORKER_SOURCE)
         self._proc = subprocess.Popen(
-            [self.python, script_path, self.build_module, self.build_func,
-             self.target, str(self.max_in_process_retries)],
+            [self.python, script_path, self.target, str(self.max_in_process_retries)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
-            text=True, env=env,
+            env=env,
         )
-        # Wait for ready signal (or death)
-        line = self._proc.stdout.readline()
+        # Ship setup: length-prefixed pickled {qprog, H_json}
+        import struct
+        H_json = self._hamiltonian.to_json() if self._hamiltonian is not None else None
+        setup = {"qprog": pickle.dumps(self._qprog), "H_json": H_json}
+        setup_bytes = pickle.dumps(setup)
+        self._proc.stdin.write(struct.pack(">I", len(setup_bytes)))
+        self._proc.stdin.write(setup_bytes)
+        self._proc.stdin.flush()
+        # Wait for ready signal
+        line = self._proc.stdout.readline().decode()
         if not line:
             code = self._proc.poll()
             raise RuntimeError(
-                f"[cudaq_metal] worker died during startup (exit={code}); "
-                "check your build_module for import errors.")
+                f"[cudaq_metal] worker died during startup (exit={code})")
         info = json.loads(line)
         if info.get("status") != "ready":
             raise RuntimeError(f"[cudaq_metal] unexpected worker startup: {info}")
@@ -195,12 +265,12 @@ class ReliableObserver:
         while True:
             self._ensure_worker()
             try:
-                self._proc.stdin.write(json.dumps(msg) + "\n")
+                self._proc.stdin.write((json.dumps(msg) + "\n").encode())
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._kill()
                 continue
-            line = self._proc.stdout.readline()
+            line = self._proc.stdout.readline().decode()
             if not line:
                 # Worker died mid-call (poisoned or crashed). Kill + restart.
                 self._kill()
@@ -255,7 +325,7 @@ class ReliableObserver:
     def close(self) -> None:
         if self._proc is not None:
             try:
-                self._proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
+                self._proc.stdin.write((json.dumps({"op": "quit"}) + "\n").encode())
                 self._proc.stdin.flush()
                 self._proc.wait(timeout=5)
             except Exception:
