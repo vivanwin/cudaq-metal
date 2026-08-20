@@ -51,6 +51,22 @@ returned object exposes the full `observe_result` API: `.expectation()`,
 Non-metal targets (`qpp-cpu`, `nvidia`, etc.) and native `@cudaq.kernel`
 objects pass through completely unchanged.
 
+## Examples
+
+Two ready-to-run scaling examples in [`examples/`](examples/):
+
+- [`brickwork_native.py`](examples/brickwork_native.py) — pure CUDA-Q,
+  random-SU(4) brickwork of arbitrary width & depth. Runs on any target;
+  the file uses `qpp-cpu` by default and documents the caveat about native
+  kernels on `--target metal`.
+- [`brickwork_classiq.py`](examples/brickwork_classiq.py) — same circuit
+  synthesized through Classiq. Runs on Metal via `qprog_to_cudaq_kernel`,
+  fully protected by the transparent reliability layer. Bump `N` upward as
+  you like.
+
+Both are ~30 lines including imports; scale up by changing the `N` and
+`DEPTH` constants at the top.
+
 ## Benchmark: warm-start QAOA (15-node Max-Cut, 30-iter COBYLA)
 
 Real measurements on an Apple M5 Pro (24 GB), CUDA-Q 0.15.1, Classiq 1.26.
