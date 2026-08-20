@@ -1,20 +1,21 @@
-"""Benchmark the two examples across qubit counts.
+"""Full 2x2 sweep: {native @cudaq.kernel, Classiq qprog_to_cudaq_kernel} × {qpp-cpu, metal}.
 
-For each N, times one `cudaq.observe(...).expectation()` call — the exact code
-the example scripts run. Same brickwork circuit (random SU(4), depth=5) for
-both, so the only variable is the engine: native @cudaq.kernel on qpp-cpu vs
-Classiq synthesize + qprog_to_cudaq_kernel on metal.
-
-Writes benchmarks/results/examples.csv; plot_examples.py renders the PNG.
+Native+metal spawns a subprocess per measurement — native kernels aren't tracked
+by cudaq_metal's transparent layer, so each fresh process gets an independent
+chance of JIT-poisoning; we retry with a new subprocess if the result matches
+the poisoned |0..0> outcome (Σ Zᵢ = N exactly).
 """
 import operator
+import os
+import subprocess
+import sys
 import time
 from functools import reduce
 
 import numpy as np
 from scipy.stats import unitary_group
 
-import cudaq_metal   # auto-registers metal + transparent mode
+import cudaq_metal
 import cudaq
 from cudaq import spin
 from classiq import (qfunc, QArray, QBit, Output, allocate, unitary, repeat,
@@ -25,13 +26,14 @@ SU4 = unitary_group.rvs(4, random_state=42)
 SU4_LIST = SU4.tolist()
 DEPTH = 5
 TRIALS = 2
-N_MIN, N_MAX_NATIVE, N_MAX_CLASSIQ = 8, 18, 20
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORKER = os.path.join(HERE, "_native_worker.py")
 
 cudaq.register_operation("su4", SU4)
 
 
 @cudaq.kernel
-def native_brickwork(n: int, depth: int):
+def native_bw(n: int, depth: int):
     q = cudaq.qvector(n)
     for layer in range(depth):
         j = layer % 2
@@ -40,21 +42,39 @@ def native_brickwork(n: int, depth: int):
             j += 2
 
 
-def time_native(N, depth):
-    cudaq.set_target("qpp-cpu")
+def _native_in_process(N, depth, target):
+    cudaq.set_target(target)
     H = reduce(operator.add, (spin.z(i) for i in range(N)))
-    # warmup once — first call pays JIT cost
-    cudaq.observe(native_brickwork, H, N, depth)
+    cudaq.observe(native_bw, H, N, depth)                # warmup
     ts = []
     for _ in range(TRIALS):
         t0 = time.perf_counter()
-        cudaq.observe(native_brickwork, H, N, depth).expectation()
+        cudaq.observe(native_bw, H, N, depth).expectation()
         ts.append(time.perf_counter() - t0)
     return ts
 
 
-def make_classiq_qprog(N, depth):
-    # `qfunc` closes over N & depth at decoration time — build fresh per N.
+def _native_subprocess(N, depth, target, max_retries=10):
+    """Fresh subprocess per trial — JIT-isolation for native+metal."""
+    ts = []
+    for _ in range(TRIALS):
+        for attempt in range(max_retries):
+            r = subprocess.run(
+                [sys.executable, WORKER, str(N), str(depth), target],
+                capture_output=True, text=True, timeout=120,
+            )
+            line = r.stdout.strip().split("\n")[-1]
+            parts = line.split()
+            t, v = float(parts[0]), float(parts[1])
+            if abs(v - N) > 1e-6:                        # not poisoned |0..0>
+                ts.append(t)
+                break
+        else:
+            raise RuntimeError(f"[N={N}] JIT-poison every attempt")
+    return ts
+
+
+def _classiq_qprog(N, depth):
     @qfunc
     def bw(q: QArray[QBit, N]):
         repeat(depth, lambda layer: [
@@ -70,13 +90,13 @@ def make_classiq_qprog(N, depth):
     return synthesize(main)
 
 
-def time_classiq(N, depth):
-    cudaq.set_target("metal")
-    qprog = make_classiq_qprog(N, depth)
+def _classiq_in_process(N, depth, target):
+    cudaq.set_target(target)
+    qprog = _classiq_qprog(N, depth)
     kernel = qprog_to_cudaq_kernel(qprog)
     H = pauli_operator_to_cudaq_spin_op(
         reduce(operator.add, (Pauli.Z(i) for i in range(N))))
-    cudaq.observe(kernel, H)  # warmup
+    cudaq.observe(kernel, H)                             # warmup
     ts = []
     for _ in range(TRIALS):
         t0 = time.perf_counter()
@@ -85,23 +105,24 @@ def time_classiq(N, depth):
     return ts
 
 
-def main():
-    out = "benchmarks/results/examples.csv"
-    with open(out, "w") as f:
-        f.write("n,depth,kind,mean,std\n")
-        for n in range(N_MIN, max(N_MAX_NATIVE, N_MAX_CLASSIQ) + 1):
-            if n <= N_MAX_NATIVE:
-                ts = time_native(n, DEPTH)
-                m, s = float(np.mean(ts)), float(np.std(ts))
-                f.write(f"{n},{DEPTH},native_qpp,{m:.4f},{s:.4f}\n"); f.flush()
-                print(f"n={n} native_qpp:    {m:6.2f}s ± {s:.2f}", flush=True)
-            if n <= N_MAX_CLASSIQ:
-                ts = time_classiq(n, DEPTH)
-                m, s = float(np.mean(ts)), float(np.std(ts))
-                f.write(f"{n},{DEPTH},classiq_metal,{m:.4f},{s:.4f}\n"); f.flush()
-                print(f"n={n} classiq_metal: {m:6.2f}s ± {s:.2f}", flush=True)
-    print(f"\nwrote {out}")
+CONFIGS = [
+    # (kind, callable, n_range)
+    ("native_qpp",    lambda n: _native_in_process(n, DEPTH, "qpp-cpu"),  range(8, 18)),
+    ("native_metal",  lambda n: _native_subprocess(n, DEPTH, "metal"),    range(8, 21)),
+    ("classiq_qpp",   lambda n: _classiq_in_process(n, DEPTH, "qpp-cpu"), range(8, 18)),
+    ("classiq_metal", lambda n: _classiq_in_process(n, DEPTH, "metal"),   range(8, 21)),
+]
 
-
-if __name__ == "__main__":
-    main()
+out = os.path.join(HERE, "results", "examples.csv")
+with open(out, "w") as f:
+    f.write("n,depth,kind,mean,std\n")
+    for kind, fn, r in CONFIGS:
+        for n in r:
+            try:
+                ts = fn(n)
+            except Exception as e:
+                print(f"n={n} {kind}: FAILED ({e})", flush=True); continue
+            m, s = float(np.mean(ts)), float(np.std(ts))
+            f.write(f"{n},{DEPTH},{kind},{m:.4f},{s:.4f}\n"); f.flush()
+            print(f"n={n:2d} {kind:14s}: {m:7.3f}s ± {s:.3f}", flush=True)
+print(f"\nwrote {out}")

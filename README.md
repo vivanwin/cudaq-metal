@@ -67,14 +67,27 @@ Two ready-to-run scaling examples in [`examples/`](examples/):
 Both are ~30 lines including imports; scale up by changing the `N` and
 `DEPTH` constants at the top.
 
-Timed against each other on the same random-SU(4) brickwork (depth=5):
+Full 2×2 matrix — {native @cudaq.kernel, Classiq qprog_to_cudaq_kernel} ×
+{qpp-cpu, metal} — on the same random-SU(4) brickwork (depth=5). Only the
+`cudaq.observe(...)` call is timed; synthesis / kernel construction happen
+before `t0`:
 
-![Examples scaling — Classiq→metal vs native→qpp-cpu](benchmarks/results/examples.png)
+![Examples scaling — engine × target matrix](benchmarks/results/examples.png)
 
-At n=18: native on qpp-cpu is 1.07 s, Classiq on Metal is 7 ms — **~150× faster**.
-Both grew from ~0.5 ms at n=8; qpp-cpu doubles per qubit as expected for a CPU
-statevector, Metal stays effectively flat until the statevector fills more of
-memory bandwidth around n=22+. Reproduce with:
+**Key observations:**
+- Both **metal** lines (native and Classiq) stay effectively flat through
+  n=20 (≤ ~20 ms per observe). The Apple GPU shrugs off depth-5 brickwork
+  up to ~1M-amplitude statevectors.
+- **native qpp-cpu** doubles per qubit — textbook CPU statevector, still
+  affordable through n=17 (~0.5 s).
+- **Classiq qpp-cpu** doubles similarly *but 15–20× slower* because the
+  Classiq compiler decomposes each SU(4) into many primitive rotations +
+  CNOTs; the "same" circuit becomes several times deeper. That decomposition
+  is invisible on the GPU (kernel launch overhead dominates), but it's the
+  full cost on CPU.
+- At n=17, **metal beats qpp-cpu by ~80× (native) and ~1000× (Classiq)**.
+
+Reproduce with:
 
 ```bash
 python benchmarks/examples_scaling_bench.py
