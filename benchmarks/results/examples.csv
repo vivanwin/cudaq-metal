@@ -54,3 +54,8 @@ n,depth,kind,mean,std
 25,5,native_metal,0.9331,0.0103
 24,5,classiq_metal,0.2685,0.0003
 25,5,classiq_metal,0.5709,0.0076
+26,5,classiq_metal,1.1243,0.0008
+27,5,classiq_metal,3.9727,0.0085
+28,5,classiq_metal,8.7804,0.2869
+29,5,classiq_metal,13.7217,0.0319
+30,5,classiq_metal,29.5458,7.9864

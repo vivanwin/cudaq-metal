@@ -116,6 +116,36 @@ python benchmarks/plot_examples.py
   transparent mode is default; useful if you want to manage a specific
   worker's lifecycle yourself.
 
+## Qubit ceiling on your machine
+
+Metal caps single `MTLBuffer` allocations at [`MTLDevice.maxBufferLength`](https://developer.apple.com/documentation/metal/mtldevice/2966563-maxbufferlength) —
+this is a *hard* Metal-API limit, [confirmed by Apple engineers on the developer
+forums](https://developer.apple.com/forums/thread/61188): allocations larger
+than `maxBufferLength` throw / return `nil`, and the officially-recommended
+workaround is splitting your data across multiple buffers. Since we hold the
+whole statevector as one contiguous MTLBuffer, that's your qubit ceiling.
+
+Empirically on an **Apple M5 Pro (24 GB unified)**:
+
+- `maxBufferLength` = **14.30 GB**
+- `recommendedMaxWorkingSetSize` = 19.07 GB (advisory)
+- **n=30 → 8.6 GB buffer → OK** (~30 s per observe, verified on-machine)
+- **n=31 → 17.2 GB buffer → fails** (exceeds `maxBufferLength`)
+
+So **n=30 is the ceiling on a 24 GB M5 Pro** regardless of how much RAM is
+free. To go higher you need either a larger Mac (`maxBufferLength` scales with
+device memory — a 64 GB M-series is roughly n=32, a 128 GB M4 Max ~n=33) or
+a redesigned engine that splits the statevector across multiple buffers.
+
+Timing curve stays log-linear right up to the wall:
+
+| n | statevector | observe |
+|---|---|---|
+| 25 | 256 MB | 0.6 s |
+| 27 | 1 GB | 4 s |
+| 29 | 4 GB | 14 s |
+| 30 | 8 GB | 30 s |
+
 ## Limitations, honestly
 
 - **fp32 statevector only** — Metal has no fp64.
