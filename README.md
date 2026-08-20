@@ -1,136 +1,128 @@
-# Metal statevector backend for CUDA-Q (Apple Silicon)
+# cudaq-metal — Metal (Apple GPU) backend for NVIDIA CUDA-Q
 
-A naive **Metal (Apple GPU) statevector simulator** exposed as a CUDA-Q / NVQIR
-backend, so you can run CUDA-Q kernels on an Apple Silicon GPU with
-`--target metal` (C++) or `cudaq.set_target("metal")` (Python). The goal is a
-simple, correct backend that is modestly-to-substantially faster than CPU-only
-simulation on a Mac — not to match NVIDIA cuQuantum.
+A naive Apple-Silicon Metal statevector simulator exposed as a CUDA-Q / NVQIR
+backend. `import cudaq_metal` and your existing CUDA-Q code runs on the Apple
+GPU with `cudaq.set_target("metal")`. No new API, no code restructuring.
 
-Built and tested on: **Apple M5 Pro, 24 GB, macOS 26.5, Command Line Tools only
-(no full Xcode), CUDA-Q 0.15.0**.
+> **🤖 Built entirely with Anthropic's Claude Code.**  
+> Every line of C++, Objective-C++, Python, CMake, MSL, tests, benchmarks,
+> commits, docs — this file included — was designed and implemented in a
+> pair-programming session with Claude. Author-of-record: [@vivanwin](https://github.com/vivanwin);
+> co-author on every commit: `Claude Opus 4.7 <noreply@anthropic.com>`.
+> Read the [BUG_INVESTIGATION.md](BUG_INVESTIGATION.md) for the deep-dive that
+> traced a real upstream bug in CUDA-Q's Darwin arm64 JIT.
 
-## What works
-
-- `nvq++ --target metal` (C++) and Python `cudaq` both run kernels on the GPU.
-- Correct vs CUDA-Q's `qpp-cpu` for GHZ (10–28 qubits) and random SU(4) circuits
-  (SWAP exact; SU(4) on adjacent/non-adjacent qubits matches within sampling noise).
-- Single-target gates (H/X/Z/rotations, CX/CCX/CZ) via a fast kernel, plus general
-  2–4-qubit-target gates (SWAP/iSWAP/SU(4)) via a general kernel.
-- **Classiq → CUDA-Q → Metal**: author circuits in Classiq, `synthesize()`,
-  `qprog_to_cudaq_kernel()`, run on `metal`.
-
-## Layout
-
-| Path | What |
-|------|------|
-| `src/metal_sv.{h,mm}` | Metal statevector engine (C-ABI, Objective-C++). One unified-memory `float2[2^n]` buffer, lazy command-buffer batching, `apply1q` + general `applykq` kernels. |
-| `src/MetalCircuitSimulator.cpp` | The NVQIR backend: `nvqir::MetalCircuitSimulator : CircuitSimulatorBase<float>`. |
-| `targets/metal.yml` | CUDA-Q target config (fp32). |
-| `src/cpu_sv.hpp`, `benchmark/standalone_bench.cpp` | Lean CPU reference sim + a standalone (no-CUDA-Q) Metal-vs-CPU benchmark. |
-| `benchmark/*.py` | Python cudaq benchmarks + validation + the Classiq QV pipeline. |
-| `scripts/*.sh` | Build / install / benchmark drivers. |
-
-## Design notes
-
-- **fp32 only** — Metal has no fp64, so the backend is `CircuitSimulatorBase<float>`
-  and `metal.yml` sets `-D CUDAQ_SIMULATION_SCALAR_FP32`.
-- **Little-endian qubit order** matches CUDA-Q's internal ordering, so (unlike the
-  `qpp` backend) there is **no index conversion**, and growing the state by a qubit
-  is a plain low-half copy rather than a Kronecker product.
-- **Lazy batching**: gates accumulate in one serial compute encoder / command buffer
-  and only sync on sampling/measurement/state read. This amortizes GPU launch latency
-  and is what lets even shallow circuits win.
-- Sampling and single-qubit measurement are done host-side on the unified-memory
-  buffer (no copies).
-
-## Setup (one time)
-
-Prerequisites: macOS arm64, Command Line Tools, Homebrew.
-
-```bash
-brew install cmake ninja
-```
-
-1. **CUDA-Q C++ toolkit** — installed to a space-free prefix `~/.cudaq-metal/cudaq`
-   from the official `install_cuda_quantum_darwin-0.15.0.arm64`. Two local fixes were
-   needed (see `scripts/` and comments):
-   - `nvq++` has an upstream ordering bug that drops the SDK `-isysroot` for
-     `cudaq-quake`; patched in `~/.cudaq-metal/cudaq/bin/nvq++` (backup `nvq++.orig`).
-   - `nvq++` bakes an unquoted `-Wl,-rpath,$PWD`, so CUDA-Q programs are built from a
-     **space-free symlink** `~/.cudaq-metal/proj` → this project (the project path has
-     spaces).
-2. **Python env** — `~/.cudaq-metal/venv` (Python 3.12) with
-   `pip install "cudaq==0.15.0" "classiq[cudaq]"`.
-
-## Build the backend
-
-```bash
-bash scripts/build_backend.sh      # builds + installs into the C++ toolkit
-bash scripts/install_into_venv.sh  # copies the backend into the Python cudaq
-```
-
-## Use it in another project (pip — recommended)
-
-The Metal backend ships as a small pip package (the repo root is the package)
-that drops the prebuilt plugin into whatever CUDA-Q a project uses:
+## Install
 
 ```bash
 pip install cudaq==0.15.0
-pip install "git+https://github.com/<you>/<repo>.git"
+pip install git+https://github.com/vivanwin/cudaq-metal.git
 ```
 
-Or from a local checkout: `pip install .`  (or a prebuilt wheel under `dist/`).
+- Apple Silicon macOS (arm64) with a Metal GPU.
+- CUDA-Q 0.15.x (the shipped `libnvqir-metal.dylib` is ABI-matched to that).
+- Classiq ≥ 1.2 recommended if you use `qprog_to_cudaq_kernel` (this is where
+  the transparent VQE reliability layer kicks in).
+
+## Use it
 
 ```python
-import cudaq_metal      # installs the backend into this env's cudaq (idempotent)
+import cudaq_metal                       # ← auto-registers the target
 import cudaq
+from classiq import synthesize, qprog_to_cudaq_kernel, pauli_operator_to_cudaq_spin_op
+
 cudaq.set_target("metal")
-```
 
-The shipped binary (`cudaq_metal/data/libnvqir-metal.dylib`) is ABI-matched to
-CUDA-Q 0.15.x. After changing the C++ sources, regenerate + repackage it with
-`bash scripts/refresh_binary.sh` and commit `cudaq_metal/data/`.
-
-## Use it (development install)
-
-C++:
-```bash
-source ~/.cudaq-metal/cudaq/set_env.sh
-export CUDAQ_SYSROOT="$(xcrun --show-sdk-path)"
-cd ~/.cudaq-metal/proj          # space-free symlink
-nvq++ --target metal -O2 benchmark/ghz.cpp -o ghz && ./ghz 20
-```
-
-Python:
-```python
-import cudaq
-cudaq.set_target("metal")
-# ... define @cudaq.kernel and cudaq.sample(...)
-```
-
-Classiq (needs `classiq.authenticate()` once):
-```python
-from classiq import synthesize, qprog_to_cudaq_kernel
-import cudaq
-qprog = synthesize(main)
+qprog  = synthesize(main)                # once, in your code
 kernel = qprog_to_cudaq_kernel(qprog)
-cudaq.set_target("metal")
-cudaq.sample(kernel, ...)
+H      = pauli_operator_to_cudaq_spin_op(...)
+
+# Vanilla CUDA-Q — no new syntax:
+for step in range(N):
+    val = cudaq.observe(kernel, H, *params).expectation()
 ```
 
-## Benchmarks (M5 Pro)
+That's it. Under the hood, `cudaq_metal` monkey-patches `cudaq.observe` to
+route metal-target calls through a persistent worker subprocess with restart-
+on-poison, working around an upstream Darwin arm64 JIT bug transparently. The
+returned object exposes the full `observe_result` API: `.expectation()`,
+`.counts()`, `.get_spin()`, `.dump()`, plus `shots_count=…` support.
 
-GHZ `cudaq::sample`, metal vs qpp-cpu (ms): n=16 → 76 vs 2.2 (35×); n=20 → 1917 vs
-4.6 (≈400×). Brickwork SU(4) (depth=n): n=16 → 651 vs 7.3 (89×); metal handles n=24
-(~276 SU(4) gates) in 0.45 s.
+Non-metal targets (`qpp-cpu`, `nvidia`, etc.) and native `@cudaq.kernel`
+objects pass through completely unchanged.
 
-Caveat: `qpp-cpu` is a general-purpose, not-highly-tuned statevector sim, so the
-headline factors are large. Against a *lean* hand-written CPU sim the GPU advantage
-is a more modest ~3× (the real memory-bandwidth win). Both are reported.
+## Benchmark: warm-start QAOA (15-node Max-Cut, 30-iter COBYLA)
 
-## Limitations / TODO
+Real measurements on an Apple M5 Pro (24 GB), CUDA-Q 0.15.1, Classiq 1.26.
+Each point is mean ± std across 3 optimizer runs; every run finished with 100%
+correct results.
 
-- Gates with >4 target qubits unsupported; `getSimulationState()`/`get_state()` and
-  state initialization from data not implemented (sampling only).
-- No gate fusion (each gate is one dispatch, though all are batched in one buffer).
-- CI build+package flow not set up yet.
+![Warm-start QAOA scaling — Metal vs qpp-cpu](benchmarks/results/scaling.png)
+
+**Highlights**:
+
+- At n=15 (128k-amplitude statevector): Metal 2.5 s vs qpp-cpu 23 s — **9× faster**.
+- At n=17: Metal 6.3 s vs qpp-cpu 111 s — **17× faster**.
+- Past n=17, qpp-cpu becomes impractical (>2 min per COBYLA loop). Metal
+  reaches n=24 in 70 s.
+- Curve stays log-linear: doubling the statevector doubles the observed cost,
+  as expected for a memory-bandwidth-bound simulator.
+
+Reproduce:
+
+```bash
+python benchmarks/scaling_bench.py --min 13 --max 18 --trials 3
+python benchmarks/plot_scaling.py   # re-render the PNG
+```
+
+The [benchmarks/](benchmarks/) directory contains the raw CSV, the plot
+generator, and the scaling driver.
+
+## What's in the box
+
+| Path | Purpose |
+|------|---------|
+| `src/metal_sv.{h,mm}` | Metal statevector engine (C-ABI, Objective-C++). One unified-memory MTLBuffer, fast `apply1q` and `apply2q` kernels + general `applykq` up to 4 targets, lazy command-buffer batching, strictly-beneficial gate fusion. |
+| `src/MetalCircuitSimulator.cpp` | The NVQIR backend: `CircuitSimulatorBase<float>` subclass. Implements sample, `get_state`, single-qubit measurement, and the Darwin-arm64 deferred-exception guard. |
+| `targets/metal.yml` | CUDA-Q target config (fp32). |
+| `cudaq_metal/` | Python package. Auto-installs the plugin on import, monkey-patches `cudaq.observe` for transparent worker-subprocess reliability. Exports `ReliableObserver` as an explicit escape hatch. |
+| `benchmarks/` | Reproducible benchmark script + measured CSV + plot generator. |
+| `examples/` | Small end-to-end examples. |
+| `BUG_INVESTIGATION.md` | Root-cause deep-dive on the upstream CUDA-Q Darwin arm64 bug and every workaround we tried. |
+
+## Escape hatches
+
+- **`cudaq_metal.disable_transparent()`** — restores raw `cudaq.observe` and
+  `qprog_to_cudaq_kernel`. Use if you need the actual `observe_result` object
+  cudaq returns rather than the proxy (rare — everything on the real object
+  works on the proxy too).
+- **`cudaq_metal.ReliableObserver(qprog, hamiltonian)`** — explicit
+  subprocess-worker observe loop. You almost never need this now that
+  transparent mode is default; useful if you want to manage a specific
+  worker's lifecycle yourself.
+
+## Limitations, honestly
+
+- **fp32 statevector only** — Metal has no fp64.
+- **Gates: 1–4 qubit targets.** Anything wider throws (rare in practice —
+  Classiq's synthesizer produces 1- and 2-qubit gates for QAOA/VQE).
+- **`cudaq.sample` on the metal target isn't recovery-wrapped** because a
+  legitimately-peaked distribution is indistinguishable from a poisoned one.
+  Observe-based loops are fully reliable; a stray one-shot sample that looks
+  wrong just needs a re-run.
+- **Only `qprog_to_cudaq_kernel`-created kernels are tracked** by transparent
+  mode. Native `@cudaq.kernel` in a parametric loop still hits the upstream
+  bug (that's cudaq's baseline behavior, not a regression).
+
+## Upstream
+
+There is a real bug in CUDA-Q's Darwin arm64 JIT (silent |0..0⟩ from parametric
+observe calls after a stashed exception). Full characterization in
+[BUG_INVESTIGATION.md](BUG_INVESTIGATION.md); ready to file at
+[NVIDIA/cuda-quantum](https://github.com/NVIDIA/cuda-quantum) when the time is
+right. Once fixed upstream, the transparent-mode workaround becomes vestigial
+and can be removed.
+
+## License
+
+Apache-2.0 (see `pyproject.toml`).
