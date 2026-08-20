@@ -67,6 +67,20 @@ Two ready-to-run scaling examples in [`examples/`](examples/):
 Both are ~30 lines including imports; scale up by changing the `N` and
 `DEPTH` constants at the top.
 
+Timed against each other on the same random-SU(4) brickwork (depth=5):
+
+![Examples scaling — Classiq→metal vs native→qpp-cpu](benchmarks/results/examples.png)
+
+At n=18: native on qpp-cpu is 1.07 s, Classiq on Metal is 7 ms — **~150× faster**.
+Both grew from ~0.5 ms at n=8; qpp-cpu doubles per qubit as expected for a CPU
+statevector, Metal stays effectively flat until the statevector fills more of
+memory bandwidth around n=22+. Reproduce with:
+
+```bash
+python benchmarks/examples_scaling_bench.py
+python benchmarks/plot_examples.py
+```
+
 ## Benchmark: warm-start QAOA (15-node Max-Cut, 30-iter COBYLA)
 
 Real measurements on an Apple M5 Pro (24 GB), CUDA-Q 0.15.1, Classiq 1.26.
