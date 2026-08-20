@@ -1,35 +1,42 @@
-"""Random-SU(4) brickwork circuit — native CUDA-Q kernel.
+"""Hardware-efficient ansatz — native CUDA-Q kernel.
 
-Uses `cudaq.set_target("qpp-cpu")` by default. You can switch to "metal" but
-be aware: native `@cudaq.kernel` objects aren't tracked by cudaq_metal's
-transparent reliability layer (only `qprog_to_cudaq_kernel`-derived kernels
-are). On Darwin arm64 you'll occasionally see the |0..0> outcome and need to
-re-run — see BUG_INVESTIGATION.md. For fully reliable Metal execution, use
-the Classiq path in `brickwork_classiq.py`.
+Per layer: RY(θ) on every qubit, then a brickwork of CX-RZ(φ)-CX on
+alternating even/odd pairs. Same primitive gate sequence Classiq emits after
+decomposition, so `brickwork_classiq.py` and this script apply the *same*
+circuit — engine × target timings are then directly comparable.
+
+Defaults to `qpp-cpu`. See docstring caveat in the top-level README about
+native kernels on `--target metal` (they bypass cudaq_metal's transparent
+reliability layer).
 """
-import cudaq_metal        # ← the one metal-related line (harmless on qpp-cpu)
+import cudaq_metal        # ← the one metal-related line
 import cudaq
 from cudaq import spin
-from scipy.stats import unitary_group
+from functools import reduce
+import operator
 
-N = 16                                              # qubits — scale me
-DEPTH = N                                           # QV-shape: depth == width
-
-cudaq.register_operation("su4", unitary_group.rvs(4, random_state=42))
+N = 16
+DEPTH = 5
+THETA, PHI = 0.5, 0.7
 
 
 @cudaq.kernel
-def brickwork(n: int, depth: int):
+def brickwork(n: int, depth: int, theta: float, phi: float):
     q = cudaq.qvector(n)
     for layer in range(depth):
-        j = layer % 2
+        for i in range(n):
+            ry(theta, q[i])
+        offset = layer % 2
+        j = offset
         while j + 1 < n:
-            su4(q[j], q[j + 1])
+            x.ctrl(q[j], q[j + 1])
+            rz(phi, q[j + 1])
+            x.ctrl(q[j], q[j + 1])
             j += 2
 
 
-H = sum(spin.z(i) for i in range(N))                # Σ Zᵢ — global magnetization
+H = reduce(operator.add, (spin.z(i) for i in range(N)))
 
-cudaq.set_target("qpp-cpu")                          # swap to "metal" — see docstring
+cudaq.set_target("qpp-cpu")                      # swap to "metal" per docstring
 print(f"<Σ Zᵢ> on {N}-qubit brickwork (depth={DEPTH}): "
-      f"{cudaq.observe(brickwork, H, N, DEPTH).expectation():+.4f}")
+      f"{cudaq.observe(brickwork, H, N, DEPTH, THETA, PHI).expectation():+.4f}")

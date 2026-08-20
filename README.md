@@ -68,24 +68,23 @@ Both are ~30 lines including imports; scale up by changing the `N` and
 `DEPTH` constants at the top.
 
 Full 2×2 matrix — {native @cudaq.kernel, Classiq qprog_to_cudaq_kernel} ×
-{qpp-cpu, metal} — on the same random-SU(4) brickwork (depth=5). Only the
-`cudaq.observe(...)` call is timed; synthesis / kernel construction happen
-before `t0`:
+{qpp-cpu, metal} — on the **same primitive-gate hardware-efficient ansatz**
+(RY layer + CX-RZ-CX brickwork, depth=5). Native and Classiq emit identical
+gate sequences, so the frontend cancels out and each line measures only its
+runtime engine. Only the `cudaq.observe(...)` call is timed; synthesis /
+kernel construction happen before `t0`. Metal paths sweep to n=23:
 
 ![Examples scaling — engine × target matrix](benchmarks/results/examples.png)
 
 **Key observations:**
-- Both **metal** lines (native and Classiq) stay effectively flat through
-  n=20 (≤ ~20 ms per observe). The Apple GPU shrugs off depth-5 brickwork
-  up to ~1M-amplitude statevectors.
-- **native qpp-cpu** doubles per qubit — textbook CPU statevector, still
-  affordable through n=17 (~0.5 s).
-- **Classiq qpp-cpu** doubles similarly *but 15–20× slower* because the
-  Classiq compiler decomposes each SU(4) into many primitive rotations +
-  CNOTs; the "same" circuit becomes several times deeper. That decomposition
-  is invisible on the GPU (kernel launch overhead dominates), but it's the
-  full cost on CPU.
-- At n=17, **metal beats qpp-cpu by ~80× (native) and ~1000× (Classiq)**.
+- The two **CPU** lines overlap: native ≈ Classiq → qpp-cpu, both doubling
+  per qubit as expected for a CPU statevector (n=17 ≈ 2 s).
+- The two **metal** lines overlap too: native ≈ Classiq → metal, ~1–10 ms
+  per observe through n=20, climbing to ~200 ms at n=23 (once the 128 MB
+  statevector starts hitting memory bandwidth).
+- **At n=17: metal beats qpp-cpu by ~300–400×**  (2 s → 6 ms).
+- Metal reaches **n=23** (128 M-amplitude statevector) in ~0.2 s, where CPU
+  is not measurable within this benchmark's budget.
 
 Reproduce with:
 

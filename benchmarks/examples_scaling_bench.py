@@ -1,74 +1,73 @@
-"""Full 2x2 sweep: {native @cudaq.kernel, Classiq qprog_to_cudaq_kernel} × {qpp-cpu, metal}.
+"""Full 2x2 sweep with matched gate set — {native @cudaq.kernel, Classiq
+qprog_to_cudaq_kernel} × {qpp-cpu, metal}. Both paths emit the same primitive
+gate sequence (RY layer + CX-RZ-CX brickwork), so the CPU-vs-GPU comparison
+isolates the runtime engine cleanly.
 
-Native+metal spawns a subprocess per measurement — native kernels aren't tracked
-by cudaq_metal's transparent layer, so each fresh process gets an independent
-chance of JIT-poisoning; we retry with a new subprocess if the result matches
-the poisoned |0..0> outcome (Σ Zᵢ = N exactly).
+Native + metal spawns a subprocess per measurement (native kernels bypass
+transparent-mode; each fresh process gets an independent JIT lottery draw and
+we retry if the result matches the poisoned |0..0> outcome).
+
+Only `cudaq.observe(...)` is timed; synth / kernel-construction / warmup
+happen before t0.
 """
-import operator
-import os
-import subprocess
-import sys
-import time
+import operator, os, subprocess, sys, time
 from functools import reduce
 
 import numpy as np
-from scipy.stats import unitary_group
 
 import cudaq_metal
 import cudaq
 from cudaq import spin
-from classiq import (qfunc, QArray, QBit, Output, allocate, unitary, repeat,
-                     synthesize, qprog_to_cudaq_kernel,
+from classiq import (qfunc, QArray, QBit, Output, allocate,
+                     RY, RZ, CX, synthesize, qprog_to_cudaq_kernel,
                      pauli_operator_to_cudaq_spin_op, Pauli)
 
-SU4 = unitary_group.rvs(4, random_state=42)
-SU4_LIST = SU4.tolist()
-DEPTH = 5
-TRIALS = 2
+DEPTH, TRIALS = 5, 2
+THETA, PHI = 0.5, 0.7
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "_native_worker.py")
 
-cudaq.register_operation("su4", SU4)
-
 
 @cudaq.kernel
-def native_bw(n: int, depth: int):
+def native_bw(n: int, depth: int, theta: float, phi: float):
     q = cudaq.qvector(n)
     for layer in range(depth):
-        j = layer % 2
+        for i in range(n):
+            ry(theta, q[i])
+        offset = layer % 2
+        j = offset
         while j + 1 < n:
-            su4(q[j], q[j + 1])
+            x.ctrl(q[j], q[j + 1])
+            rz(phi, q[j + 1])
+            x.ctrl(q[j], q[j + 1])
             j += 2
 
 
 def _native_in_process(N, depth, target):
     cudaq.set_target(target)
     H = reduce(operator.add, (spin.z(i) for i in range(N)))
-    cudaq.observe(native_bw, H, N, depth)                # warmup
+    cudaq.observe(native_bw, H, N, depth, THETA, PHI)
     ts = []
     for _ in range(TRIALS):
         t0 = time.perf_counter()
-        cudaq.observe(native_bw, H, N, depth).expectation()
+        cudaq.observe(native_bw, H, N, depth, THETA, PHI).expectation()
         ts.append(time.perf_counter() - t0)
     return ts
 
 
 def _native_subprocess(N, depth, target, max_retries=10):
-    """Fresh subprocess per trial — JIT-isolation for native+metal."""
     ts = []
     for _ in range(TRIALS):
         for attempt in range(max_retries):
             r = subprocess.run(
                 [sys.executable, WORKER, str(N), str(depth), target],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=180,
             )
             line = r.stdout.strip().split("\n")[-1]
             parts = line.split()
             t, v = float(parts[0]), float(parts[1])
-            if abs(v - N) > 1e-6:                        # not poisoned |0..0>
-                ts.append(t)
-                break
+            if abs(v - N) > 1e-6:                    # not poisoned |0..0>
+                ts.append(t); break
         else:
             raise RuntimeError(f"[N={N}] JIT-poison every attempt")
     return ts
@@ -77,10 +76,14 @@ def _native_subprocess(N, depth, target, max_retries=10):
 def _classiq_qprog(N, depth):
     @qfunc
     def bw(q: QArray[QBit, N]):
-        repeat(depth, lambda layer: [
-            unitary(SU4_LIST, [q[j], q[j + 1]])
-            for j in range(0, N - 1, 2)
-        ])
+        for layer in range(depth):
+            for i in range(N):
+                RY(THETA, q[i])
+            offset = layer % 2
+            for j in range(offset, N - 1, 2):
+                CX(q[j], q[j + 1])
+                RZ(PHI, q[j + 1])
+                CX(q[j], q[j + 1])
 
     @qfunc
     def main(q: Output[QArray[QBit, N]]):
@@ -96,7 +99,7 @@ def _classiq_in_process(N, depth, target):
     kernel = qprog_to_cudaq_kernel(qprog)
     H = pauli_operator_to_cudaq_spin_op(
         reduce(operator.add, (Pauli.Z(i) for i in range(N))))
-    cudaq.observe(kernel, H)                             # warmup
+    cudaq.observe(kernel, H)
     ts = []
     for _ in range(TRIALS):
         t0 = time.perf_counter()
@@ -106,11 +109,10 @@ def _classiq_in_process(N, depth, target):
 
 
 CONFIGS = [
-    # (kind, callable, n_range)
     ("native_qpp",    lambda n: _native_in_process(n, DEPTH, "qpp-cpu"),  range(8, 18)),
-    ("native_metal",  lambda n: _native_subprocess(n, DEPTH, "metal"),    range(8, 21)),
+    ("native_metal",  lambda n: _native_subprocess(n, DEPTH, "metal"),    range(8, 24)),
     ("classiq_qpp",   lambda n: _classiq_in_process(n, DEPTH, "qpp-cpu"), range(8, 18)),
-    ("classiq_metal", lambda n: _classiq_in_process(n, DEPTH, "metal"),   range(8, 21)),
+    ("classiq_metal", lambda n: _classiq_in_process(n, DEPTH, "metal"),   range(8, 24)),
 ]
 
 out = os.path.join(HERE, "results", "examples.csv")
@@ -124,5 +126,5 @@ with open(out, "w") as f:
                 print(f"n={n} {kind}: FAILED ({e})", flush=True); continue
             m, s = float(np.mean(ts)), float(np.std(ts))
             f.write(f"{n},{DEPTH},{kind},{m:.4f},{s:.4f}\n"); f.flush()
-            print(f"n={n:2d} {kind:14s}: {m:7.3f}s ± {s:.3f}", flush=True)
+            print(f"n={n:2d} {kind:14s}: {m:8.4f}s ± {s:.4f}", flush=True)
 print(f"\nwrote {out}")

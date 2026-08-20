@@ -1,9 +1,9 @@
-"""Random-SU(4) brickwork circuit — Classiq synthesis + CUDA-Q Metal execution.
+"""Same hardware-efficient ansatz, synthesized through Classiq.
 
-The Classiq compiler synthesizes the ansatz, ``qprog_to_cudaq_kernel`` converts
-it into a CUDA-Q kernel, and ``cudaq.observe`` runs on the Apple GPU. Fully
-reliable across arbitrary parametric loops thanks to cudaq_metal's transparent
-reliability layer (see the top-level README).
+Emits the same primitive gates as `brickwork_native.py` (RY on every qubit,
+then CX-RZ-CX brickwork per layer), so timings are directly comparable.
+Runs on Metal via qprog_to_cudaq_kernel; the transparent reliability layer
+handles the JIT bug automatically.
 
 Requires ``classiq.authenticate()`` once.
 """
@@ -12,23 +12,25 @@ import operator
 
 import cudaq_metal        # ← the one metal-related line
 import cudaq
-from scipy.stats import unitary_group
-from classiq import (qfunc, QArray, QBit, Output, allocate, unitary, repeat,
-                     synthesize, qprog_to_cudaq_kernel,
+from classiq import (qfunc, QArray, QBit, Output, allocate,
+                     RY, RZ, CX, synthesize, qprog_to_cudaq_kernel,
                      pauli_operator_to_cudaq_spin_op, Pauli)
 
-N = 15                                              # qubits — scale me
+N = 16
 DEPTH = 5
-
-SU4 = unitary_group.rvs(4, random_state=42).tolist()
+THETA, PHI = 0.5, 0.7
 
 
 @qfunc
 def brickwork(q: QArray[QBit, N]):
-    repeat(DEPTH, lambda layer: [
-        unitary(SU4, [q[j], q[j + 1]])
-        for j in range(0, N - 1, 2)
-    ])
+    for layer in range(DEPTH):
+        for i in range(N):
+            RY(THETA, q[i])
+        offset = layer % 2
+        for j in range(offset, N - 1, 2):
+            CX(q[j], q[j + 1])
+            RZ(PHI, q[j + 1])
+            CX(q[j], q[j + 1])
 
 
 @qfunc
