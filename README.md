@@ -94,33 +94,6 @@ python benchmarks/examples_scaling_bench.py
 python benchmarks/plot_examples.py
 ```
 
-## Benchmark: warm-start QAOA (15-node Max-Cut, 30-iter COBYLA)
-
-Real measurements on an Apple M5 Pro (24 GB), CUDA-Q 0.15.1, Classiq 1.26.
-Each point is mean ± std across 3 optimizer runs; every run finished with 100%
-correct results.
-
-![Warm-start QAOA scaling — Metal vs qpp-cpu](benchmarks/results/scaling.png)
-
-**Highlights**:
-
-- At n=15 (128k-amplitude statevector): Metal 2.5 s vs qpp-cpu 23 s — **9× faster**.
-- At n=17: Metal 6.3 s vs qpp-cpu 111 s — **17× faster**.
-- Past n=17, qpp-cpu becomes impractical (>2 min per COBYLA loop). Metal
-  reaches n=24 in 70 s.
-- Curve stays log-linear: doubling the statevector doubles the observed cost,
-  as expected for a memory-bandwidth-bound simulator.
-
-Reproduce:
-
-```bash
-python benchmarks/scaling_bench.py --min 13 --max 18 --trials 3
-python benchmarks/plot_scaling.py   # re-render the PNG
-```
-
-The [benchmarks/](benchmarks/) directory contains the raw CSV, the plot
-generator, and the scaling driver.
-
 ## What's in the box
 
 | Path | Purpose |
