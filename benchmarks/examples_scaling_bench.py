@@ -110,9 +110,9 @@ def _classiq_in_process(N, depth, target):
 
 CONFIGS = [
     ("native_qpp",    lambda n: _native_in_process(n, DEPTH, "qpp-cpu"),  range(8, 18)),
-    ("native_metal",  lambda n: _native_subprocess(n, DEPTH, "metal"),    range(8, 24)),
+    ("native_metal",  lambda n: _native_subprocess(n, DEPTH, "metal"),    range(8, 26)),
     ("classiq_qpp",   lambda n: _classiq_in_process(n, DEPTH, "qpp-cpu"), range(8, 18)),
-    ("classiq_metal", lambda n: _classiq_in_process(n, DEPTH, "metal"),   range(8, 24)),
+    ("classiq_metal", lambda n: _classiq_in_process(n, DEPTH, "metal"),   range(8, 26)),
 ]
 
 out = os.path.join(HERE, "results", "examples.csv")
