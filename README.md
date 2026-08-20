@@ -56,13 +56,13 @@ objects pass through completely unchanged.
 Two ready-to-run scaling examples in [`examples/`](examples/):
 
 - [`brickwork_native.py`](examples/brickwork_native.py) — pure CUDA-Q,
-  random-SU(4) brickwork of arbitrary width & depth. Runs on any target;
-  the file uses `qpp-cpu` by default and documents the caveat about native
-  kernels on `--target metal`.
-- [`brickwork_classiq.py`](examples/brickwork_classiq.py) — same circuit
-  synthesized through Classiq. Runs on Metal via `qprog_to_cudaq_kernel`,
-  fully protected by the transparent reliability layer. Bump `N` upward as
-  you like.
+  hardware-efficient ansatz (RY layer + CX-RZ-CX brickwork). Runs on any
+  target; the file uses `qpp-cpu` by default and documents the caveat about
+  native kernels on `--target metal`.
+- [`brickwork_classiq.py`](examples/brickwork_classiq.py) — **identical
+  gate sequence** synthesized through Classiq. Runs on Metal via
+  `qprog_to_cudaq_kernel`, fully protected by the transparent reliability
+  layer. Bump `N` upward as you like.
 
 Both are ~30 lines including imports; scale up by changing the `N` and
 `DEPTH` constants at the top.
@@ -80,8 +80,8 @@ kernel construction happen before `t0`. Metal paths sweep to n=25:
 - The two **CPU** lines overlap: native ≈ Classiq → qpp-cpu, both doubling
   per qubit as expected for a CPU statevector (n=17 ≈ 2 s).
 - The two **metal** lines overlap too: native ≈ Classiq → metal, ~1–10 ms
-  per observe through n=20, climbing to ~500–900 ms at n=25 (once the 512 MB
-  statevector saturates memory bandwidth).
+  per observe through n=20, climbing to ~500–900 ms at n=25 (256 MB statevector — where
+  memory bandwidth dominates).
 - **At n=17: metal beats qpp-cpu by ~300–400×**  (2 s → 6 ms).
 - Metal reaches **n=25** (33 M-amplitude statevector) in ~0.6–0.9 s, where CPU
   is not measurable within this benchmark's budget.
