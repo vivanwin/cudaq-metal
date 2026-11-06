@@ -14,7 +14,7 @@ GPU with `cudaq.set_target("metal")`. No new API, no code restructuring.
 > pair-programming session with Claude. Author-of-record: [@vivanwin](https://github.com/vivanwin);
 > co-author on every commit: Claude (Anthropic), see the `Co-Authored-By` trailers.
 > Read the [BUG_INVESTIGATION.md](BUG_INVESTIGATION.md) for the deep-dive that
-> traced a real upstream bug in CUDA-Q's Darwin arm64 JIT.
+> traced a real upstream bug in CUDA-Q's Darwin arm64 JIT (fixed in CUDA-Q 0.16).
 
 ## Install
 
@@ -32,8 +32,8 @@ pip install git+https://github.com/vivanwin/cudaq-metal.git
   `pip install cudaq` on macOS). Pin `cudaq==0.16.0`: the newer
   `cudaq==0.16.0.post1` can't be installed on macOS because it requires a
   `cuda-quantum-cu13==0.16.0.post1` that NVIDIA only published for Linux.
-- Classiq (tested with 1.34) if you use `qprog_to_cudaq_kernel` (this is where
-  the transparent VQE reliability layer kicks in).
+- Optional: Classiq (tested with 1.34) if you build kernels with
+  `qprog_to_cudaq_kernel`.
 
 ## Use it
 
@@ -53,27 +53,22 @@ for step in range(N):
     val = cudaq.observe(kernel, H, *params).expectation()
 ```
 
-That's it. Under the hood, `cudaq_metal` monkey-patches `cudaq.observe` to
-route metal-target calls through a persistent worker subprocess with restart-
-on-poison, working around an upstream Darwin arm64 JIT bug transparently. The
-returned object exposes the full `observe_result` API: `.expectation()`,
-`.counts()`, `.get_spin()`, `.dump()`, plus `shots_count=…` support.
-
-Non-metal targets (`qpp-cpu`, `nvidia`, etc.) and native `@cudaq.kernel`
-objects pass through completely unchanged.
+That's it. `import cudaq_metal` only copies the plugin into your cudaq install
+so the `metal` target exists; it doesn't patch anything. From there it's plain
+CUDA-Q: `cudaq.sample`, `cudaq.observe` and `cudaq.get_state` return cudaq's
+own result objects, for native `@cudaq.kernel` functions and Classiq-built
+kernels alike.
 
 ## Examples
 
 Two ready-to-run scaling examples in [`examples/`](examples/):
 
 - [`brickwork_native.py`](examples/brickwork_native.py) — pure CUDA-Q,
-  hardware-efficient ansatz (RY layer + CX-RZ-CX brickwork). Runs on any
-  target; the file uses `qpp-cpu` by default and documents the caveat about
-  native kernels on `--target metal`.
+  hardware-efficient ansatz (RY layer + CX-RZ-CX brickwork). Runs on `metal`
+  by default; set `TARGET = "qpp-cpu"` to compare with the CPU simulator.
 - [`brickwork_classiq.py`](examples/brickwork_classiq.py) — **identical
   gate sequence** synthesized through Classiq. Runs on Metal via
-  `qprog_to_cudaq_kernel`, fully protected by the transparent reliability
-  layer. Bump `N` upward as you like.
+  `qprog_to_cudaq_kernel`. Bump `N` upward as you like.
 
 Both are ~30 lines including imports; scale up by changing the `N` and
 `DEPTH` constants at the top.
@@ -109,13 +104,13 @@ python benchmarks/plot_examples.py
 | Path | Purpose |
 |------|---------|
 | `src/metal_sv.{h,mm}` | Metal statevector engine (C-ABI, Objective-C++). One unified-memory MTLBuffer, fast `apply1q` and `apply2q` kernels + general `applykq` up to 4 targets, lazy command-buffer batching, strictly-beneficial gate fusion. |
-| `src/MetalCircuitSimulator.cpp` | The NVQIR backend: `CircuitSimulatorBase<float>` subclass. Implements sample, `get_state`, single-qubit measurement, and the Darwin-arm64 deferred-exception guard. |
+| `src/MetalCircuitSimulator.cpp` | The NVQIR backend: `CircuitSimulatorBase<float>` subclass. Implements sample, `get_state`, single-qubit measurement, and a tripwire that warns loudly if cudaq ever silently drops a kernel's gates again (the old Darwin arm64 bug). |
 | `targets/metal.yml` | CUDA-Q target config (fp32). |
 | `scripts/` | Build tooling: `fetch_cudaq_headers.py` (pulls the ~0.7 MB of CUDA-Q headers the plugin needs from the matching source tag), `build_backend.sh`, `refresh_binary.sh` (rebuild + bundle + wheel). |
-| `cudaq_metal/` | Python package. Auto-installs the plugin on import, monkey-patches `cudaq.observe` for transparent worker-subprocess reliability. Exports `ReliableObserver` as an explicit escape hatch. |
+| `cudaq_metal/` | Python package. Bundles the prebuilt plugin and installs it into the active cudaq on import (also available as `cudaq-metal-install`). |
 | `benchmarks/` | Reproducible benchmark script + measured CSV + plot generator. |
 | `examples/` | Small end-to-end examples. |
-| `BUG_INVESTIGATION.md` | Root-cause deep-dive on the upstream CUDA-Q Darwin arm64 bug and every workaround we tried. |
+| `BUG_INVESTIGATION.md` | Root-cause deep-dive on the (now fixed) CUDA-Q Darwin arm64 bug and every workaround we tried. |
 
 ## Building from source
 
@@ -134,17 +129,6 @@ plugin against the wheel's own libraries, copies it into `cudaq_metal/data/`
 and writes the wheel to `dist/`. For a new CUDA-Q minor version also bump
 `COMPATIBLE_CUDAQ` in `cudaq_metal/_install.py` and the `cuda-quantum-cu13`
 pin in `pyproject.toml`.
-
-## Escape hatches
-
-- **`cudaq_metal.disable_transparent()`** — restores raw `cudaq.observe` and
-  `qprog_to_cudaq_kernel`. Use if you need the actual `observe_result` object
-  cudaq returns rather than the proxy (rare — everything on the real object
-  works on the proxy too).
-- **`cudaq_metal.ReliableObserver(qprog, hamiltonian)`** — explicit
-  subprocess-worker observe loop. You almost never need this now that
-  transparent mode is default; useful if you want to manage a specific
-  worker's lifecycle yourself.
 
 ## Qubit ceiling on your machine
 
@@ -181,23 +165,24 @@ Timing curve stays log-linear right up to the wall:
 - **fp32 statevector only** — Metal has no fp64.
 - **Gates: 1–4 qubit targets.** Anything wider throws (rare in practice —
   Classiq's synthesizer produces 1- and 2-qubit gates for QAOA/VQE).
-- **`cudaq.sample` on the metal target isn't recovery-wrapped** because a
-  legitimately-peaked distribution is indistinguishable from a poisoned one.
-  Observe-based loops are fully reliable; a stray one-shot sample that looks
-  wrong just needs a re-run.
-- **Only `qprog_to_cudaq_kernel`-created kernels are tracked** by transparent
-  mode. Native `@cudaq.kernel` in a parametric loop still hits the upstream
-  bug (that's cudaq's baseline behavior, not a regression).
+- **One CUDA-Q minor version per release.** The plugin is compiled against
+  CUDA-Q's C++ internals, so each CUDA-Q minor release needs a rebuild (see
+  [Building from source](#building-from-source)).
 
-## Upstream
+## The Darwin arm64 bug (fixed in CUDA-Q 0.16)
 
-There is a real bug in CUDA-Q's Darwin arm64 JIT (silent |0..0⟩ from parametric
-observe calls after a stashed exception). Full characterization in
-[BUG_INVESTIGATION.md](BUG_INVESTIGATION.md); ready to file at
-[NVIDIA/cuda-quantum](https://github.com/NVIDIA/cuda-quantum) when the time is
-right. Once fixed upstream, the transparent-mode workaround becomes vestigial
-and can be removed.
+Up to CUDA-Q 0.15, parametric `observe` loops on Apple Silicon silently
+returned the untouched |0..0⟩ state in a large fraction of processes: an
+exception stashed inside a JIT frame made cudaq drop every gate. cudaq-metal
+0.1 shipped a workaround (a worker subprocess behind a patched
+`cudaq.observe`, plus `ReliableObserver`). CUDA-Q 0.16 fixed the underlying
+problem: with no workaround, 1,050 observes across 35 fresh processes
+(Classiq brickwork, 15-qubit warm-start QAOA, native `@cudaq.kernel` loops)
+all matched `qpp-cpu`. So 0.2.0 removed the workaround, which also makes
+observe loops roughly 7× faster. The plugin still prints a loud warning if a
+kernel's gates are ever silently dropped again. Full history in
+[BUG_INVESTIGATION.md](BUG_INVESTIGATION.md).
 
 ## License
 
-Apache-2.0 (see `pyproject.toml`).
+Apache-2.0 (see [`LICENSE`](LICENSE)).

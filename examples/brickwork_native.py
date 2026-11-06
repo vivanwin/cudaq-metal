@@ -5,9 +5,8 @@ alternating even/odd pairs. Same primitive gate sequence Classiq emits after
 decomposition, so `brickwork_classiq.py` and this script apply the *same*
 circuit — engine × target timings are then directly comparable.
 
-Defaults to `qpp-cpu`. See docstring caveat in the top-level README about
-native kernels on `--target metal` (they bypass cudaq_metal's transparent
-reliability layer).
+Runs on the Apple GPU via the `metal` target; change TARGET to "qpp-cpu" to
+compare against CUDA-Q's CPU simulator.
 """
 import cudaq_metal        # ← the one metal-related line
 import cudaq
@@ -17,6 +16,7 @@ import operator
 
 N = 16
 DEPTH = 5
+TARGET = "metal"
 THETA, PHI = 0.5, 0.7
 
 
@@ -37,6 +37,6 @@ def brickwork(n: int, depth: int, theta: float, phi: float):
 
 H = reduce(operator.add, (spin.z(i) for i in range(N)))
 
-cudaq.set_target("qpp-cpu")                      # swap to "metal" per docstring
-print(f"<Σ Zᵢ> on {N}-qubit brickwork (depth={DEPTH}): "
+cudaq.set_target(TARGET)
+print(f"<Σ Zᵢ> on {N}-qubit brickwork (depth={DEPTH}, {TARGET}): "
       f"{cudaq.observe(brickwork, H, N, DEPTH, THETA, PHI).expectation():+.4f}")

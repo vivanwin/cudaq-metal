@@ -347,53 +347,34 @@ protected:
   /// (multi-)controlled-X/Z, i.e. GHZ and most textbook circuits.
   int gateCount_ = 0;
 
-  // Defensive check: cudaq's `deferOrThrowKernelException` stashes JIT-frame
-  // exceptions on the ExecutionContext because a C++ exception cannot unwind
-  // through a JIT frame on Darwin arm64. In that state, `enqueueGate` and
-  // `flushGateQueueImpl` become no-ops, and sampling then returns an untouched
-  // |0..0> state — a silently wrong answer that has bitten every multi-
-  // evaluation workflow on this backend (see BUG_INVESTIGATION.md).
+  // Tripwire for a silently-dropped kernel. cudaq's
+  // `deferOrThrowKernelException` stashes exceptions raised inside a JIT frame
+  // on the ExecutionContext; while one is stashed, `enqueueGate` and
+  // `flushGateQueueImpl` are no-ops, so the kernel's gates are never applied
+  // and sampling reads the untouched |0..0> state — a silently wrong answer.
+  // On CUDA-Q <= 0.15 this happened routinely on Darwin arm64 (see
+  // BUG_INVESTIGATION.md); 0.16 fixed it (0 wrong results in 1050 observes
+  // across 35 fresh processes). We keep this check so a regression is loud
+  // instead of silent.
   //
-  // We can't just `throw` from here — if we're still inside a JIT launch frame
-  // (ctx->inKernelLaunch=true), the throw itself would hit the same Darwin
-  // arm64 unwinder bug and terminate the process. So:
-  //   - print a loud, unmissable warning to stderr on every affected call
-  //   - clear the deferred exception so the next kernel invocation gets a
-  //     fresh chance (rather than being permanently poisoned)
-  //   - throw only when it is safe to do so (outside the JIT launch frame)
+  // It only warns: it does not throw (a throw inside a JIT launch frame hits
+  // the same unwinder problem and terminates the process) and it does not
+  // clear the stashed exception (clearing from under the runtime crashed
+  // cudaq's finalization path when we tried it on 0.15).
   static void checkNotSilentlyDeferred(const char *op) {
     if (!kernelExecutionDeferred())
       return;
-    auto *ctx = cudaq::getExecutionContext();
-    const bool safeToThrow = !ctx || !ctx->inKernelLaunch;
-    // Always warn loudly — this is the last chance to tell the caller the
-    // result is untrustworthy.
     fprintf(stderr,
             "\n\n==============================================================================\n"
             "  [metal] WARNING: %s() called with a deferred kernel exception.\n"
-            "  cudaq discarded this kernel's gate queue (no gates were applied)\n"
-            "  due to an upstream Darwin arm64 JIT-frame exception. The state is\n"
-            "  the untouched |0..0>, so any result computed from it is WRONG.\n"
-            "  This process's cudaq state is now inconsistent; RESTART the Python\n"
-            "  process and re-run. This is a known upstream cudaq bug; see\n"
-            "  BUG_INVESTIGATION.md in the cudaq-metal repo for details.\n"
+            "  cudaq discarded this kernel's gate queue (no gates were applied),\n"
+            "  so the state is the untouched |0..0> and any result computed from\n"
+            "  it is WRONG. Restart the Python process and re-run.\n"
+            "  This was a known CUDA-Q bug on Darwin arm64, fixed in CUDA-Q 0.16;\n"
+            "  seeing it again means a regression. Please report it at\n"
+            "  https://github.com/vivanwin/cudaq-metal/issues\n"
             "==============================================================================\n\n",
             op);
-    // NB: we deliberately do NOT clear ctx->deferredKernelException here.
-    // Clearing seemed a good idea (poison-vs-fresh) but in practice caused a
-    // downstream crash — apparently cudaq relies on that flag remaining set
-    // until *it* clears it, and unsetting from underneath the runtime races
-    // against something in the observe/sample finalization path.
-    (void)ctx;
-    // We deliberately DO NOT throw here. Throwing from sample()/get_state()
-    // while inKernelLaunch=true hits the same Darwin arm64 unwinder bug the
-    // deferred-exception mechanism was invented to work around, and terminates
-    // the process. Instead we fall through and let the (wrong) |0..0> state be
-    // sampled. The warning above is our only signal to the user; they should
-    // notice, kill the process, and restart. The alternative (silent zeros
-    // with no warning) is what shipped before this defensive check was added
-    // and was the whole reason BUG_INVESTIGATION.md exists.
-    (void)safeToThrow;
   }
   void applyGate(const GateApplicationTask &task) override {
     const int nT = static_cast<int>(task.targets.size());
@@ -604,18 +585,6 @@ public:
 };
 
 } // namespace nvqir
-
-/// Exported C helper: clear cudaq's deferredKernelException from Python.
-/// Python is always outside a JIT launch frame, so this is safe.
-/// Returns 1 if it cleared something, 0 otherwise.
-extern "C" int metal_clear_deferred_kernel_exception() {
-  auto *ctx = cudaq::getExecutionContext();
-  if (ctx && ctx->deferredKernelException) {
-    ctx->deferredKernelException = nullptr;
-    return 1;
-  }
-  return 0;
-}
 
 /// Register this simulator with NVQIR under the name "metal".
 NVQIR_REGISTER_SIMULATOR(nvqir::MetalCircuitSimulator, metal)

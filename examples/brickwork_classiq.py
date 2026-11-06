@@ -2,8 +2,7 @@
 
 Emits the same primitive gates as `brickwork_native.py` (RY on every qubit,
 then CX-RZ-CX brickwork per layer), so timings are directly comparable.
-Runs on Metal via qprog_to_cudaq_kernel; the transparent reliability layer
-handles the JIT bug automatically.
+Runs on Metal via qprog_to_cudaq_kernel.
 
 Requires ``classiq.authenticate()`` once.
 """

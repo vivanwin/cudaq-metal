@@ -1,9 +1,25 @@
 # Metal backend + CUDA-Q kernel-builder: repeated-evaluation bug
 
-**Status: root cause fully characterized (upstream cudaq bug). Best-effort
-mitigations shipped in this repo (`checkNotSilentlyDeferred` warning banner +
-`cudaq_metal.reset` / `cudaq_metal.observe` / `cudaq_metal.sample`). Full
-reliability requires an upstream cudaq fix or a subprocess-per-call workflow.**
+**Status (2026-11-06): fixed upstream in CUDA-Q 0.16.** With every workaround
+removed, 1,050 parametric `observe` calls across 35 fresh processes (Classiq
+brickwork, 15-qubit warm-start QAOA built through Classiq, native
+`@cudaq.kernel` loops) all matched `qpp-cpu`, and the
+`checkNotSilentlyDeferred` banner never fired. On 0.15 most processes were
+poisoned. CUDA-Q 0.16 reworked the deferral code (`measureQubit` exceptions are
+now deferred too and `rethrowDeferredKernelException()` is part of the public
+`ExecutionContext` API). cudaq-metal 0.2.0 therefore removed the Python
+workarounds (`reset`/`observe`/`sample` wrappers, `ReliableObserver`,
+transparent mode) and the ctypes clear helper; only the C++ warning banner
+remains, as a tripwire for regressions.
+
+Everything below is the original investigation on CUDA-Q 0.15, kept as a
+record.
+
+**Original status (0.15): root cause fully characterized (upstream cudaq bug).
+Best-effort mitigations shipped in this repo (`checkNotSilentlyDeferred` warning
+banner + `cudaq_metal.reset` / `cudaq_metal.observe` / `cudaq_metal.sample`).
+Full reliability required an upstream cudaq fix or a subprocess-per-call
+workflow.**
 
 ## Root cause (2026-08-18)
 
@@ -78,9 +94,9 @@ seems set early (probably at first Classiq-kernel invocation) and doesn't
 recover in-process. A fresh Python process might be healthy; if it isn't, no
 amount of `reset()` / retry / re-set-target rescues it.
 
-## What's shipped
+## What shipped in cudaq-metal 0.1 (items 2–3 removed in 0.2)
 
-1. **`checkNotSilentlyDeferred` in `MetalCircuitSimulator.cpp`** — called at the
+1. **`checkNotSilentlyDeferred` in `MetalCircuitSimulator.cpp`** (still there) — called at the
    top of `sample()` and `getSimulationState()`. Prints a loud, unmissable
    stderr banner on every affected call so a silent `|0..0⟩` result is at
    least visible. Cannot itself throw (would hit the unwinder bug) or clear
@@ -93,7 +109,7 @@ amount of `reset()` / retry / re-set-target rescues it.
    that call `reset()` and retry-on-`|0..0⟩` up to a configurable number of
    attempts. Useful for "healthy" processes; raises after N failures otherwise.
 
-## Recommended usage
+## Recommended usage on CUDA-Q ≤ 0.15 with cudaq-metal 0.1 (historical)
 
 ```python
 import cudaq
@@ -120,7 +136,7 @@ communicate the result back.
 ../cudaq\ qaoa/.venv/bin/python benchmark/repro_realqaoa.py
 ```
 
-## Upstream ask
+## Upstream ask (no longer needed — fixed in CUDA-Q 0.16)
 
 - File at https://github.com/NVIDIA/cuda-quantum with a minimal repro of
   `benchmark/repro_realqaoa.py`.

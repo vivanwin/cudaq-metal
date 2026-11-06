@@ -3,9 +3,9 @@ qprog_to_cudaq_kernel} × {qpp-cpu, metal}. Both paths emit the same primitive
 gate sequence (RY layer + CX-RZ-CX brickwork), so the CPU-vs-GPU comparison
 isolates the runtime engine cleanly.
 
-Native + metal spawns a subprocess per measurement (native kernels bypass
-transparent-mode; each fresh process gets an independent JIT lottery draw and
-we retry if the result matches the poisoned |0..0> outcome).
+Native + metal spawns a subprocess per measurement. That isolation was needed
+on CUDA-Q <= 0.15 (Darwin JIT bug, see BUG_INVESTIGATION.md) and is kept so the
+published numbers stay reproducible; on CUDA-Q 0.16 it is no longer required.
 
 Only `cudaq.observe(...)` is timed; synth / kernel-construction / warmup
 happen before t0.
