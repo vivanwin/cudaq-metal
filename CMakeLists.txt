@@ -36,7 +36,7 @@ if(NVQIR_DIR)
   # --- Official toolkit mode -------------------------------------------------
   find_package(NVQIR REQUIRED)
   nvqir_add_backend(metal false ${METAL_SOURCES})
-  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/targets/metal.yml
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cudaq_metal/data/metal.yml
           DESTINATION ${NVQIR_SIMULATOR_CONFIG_PATH})
 else()
   # --- pip-wheel mode (default) ----------------------------------------------

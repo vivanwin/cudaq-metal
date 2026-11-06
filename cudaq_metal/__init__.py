@@ -8,7 +8,8 @@ Usage in any project whose environment has a compatible ``cudaq``::
     # ... plain CUDA-Q from here: cudaq.sample / cudaq.observe / cudaq.get_state
 
 Importing this package installs the backend automatically (idempotent) and
-does nothing else — no cudaq functions are patched. You can also install or
+does nothing else — no cudaq functions are patched. Import it *before* cudaq:
+cudaq reads its list of targets once, at import. You can also install or
 refresh it explicitly with ``cudaq_metal.install(force=True)`` or the
 ``cudaq-metal-install`` console command.
 """

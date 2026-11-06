@@ -24,6 +24,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 
 REPO = "NVIDIA/cuda-quantum"
@@ -38,18 +40,25 @@ SEARCH_PREFIXES = (
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
 
 
-def _open(url: str, api: bool = False):
+def _open(url: str, api: bool = False) -> bytes:
     req = urllib.request.Request(url)
     token = os.environ.get("GITHUB_TOKEN")
     if api and token:
         req.add_header("Authorization", f"Bearer {token}")
-    last = None
-    for _ in range(4):
+    attempts = 4
+    for attempt in range(attempts):
         try:
-            return urllib.request.urlopen(req, timeout=60).read()
-        except Exception as e:  # transient network errors: retry
-            last = e
-    raise RuntimeError(f"failed to fetch {url}: {last}")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            # 4xx (unknown tag, rate limit, ...) won't fix itself; 5xx/429 may.
+            if (e.code < 500 and e.code != 429) or attempt == attempts - 1:
+                raise RuntimeError(f"failed to fetch {url}: HTTP {e.code} {e.reason}") from e
+        except OSError as e:  # connection reset, timeout, DNS: retry
+            if attempt == attempts - 1:
+                raise RuntimeError(f"failed to fetch {url}: {e}") from e
+        time.sleep(2**attempt)
+    raise AssertionError("unreachable")
 
 
 def _repo_files(version: str) -> set[str]:
@@ -87,8 +96,11 @@ def fetch(version: str, out_dir: str) -> int:
             raw = f"https://raw.githubusercontent.com/{REPO}/{version}/{src}"
             text = _open(raw).decode("utf-8")
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(dst, "w", encoding="utf-8") as f:
+            # Write-then-rename: an interrupted run must not leave a truncated
+            # header that later runs would trust as cached.
+            with open(dst + ".part", "w", encoding="utf-8") as f:
                 f.write(text)
+            os.replace(dst + ".part", dst)
             fetched += 1
         here = os.path.dirname(inc)
         for child in INCLUDE_RE.findall(text):

@@ -8,7 +8,7 @@ circuit — engine × target timings are then directly comparable.
 Runs on the Apple GPU via the `metal` target; change TARGET to "qpp-cpu" to
 compare against CUDA-Q's CPU simulator.
 """
-import cudaq_metal        # ← the one metal-related line
+import cudaq_metal  # noqa: F401  ← the one metal-related line (registers the target)
 import cudaq
 from cudaq import spin
 from functools import reduce

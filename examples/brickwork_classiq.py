@@ -9,7 +9,7 @@ Requires ``classiq.authenticate()`` once.
 from functools import reduce
 import operator
 
-import cudaq_metal        # ← the one metal-related line
+import cudaq_metal  # noqa: F401  ← the one metal-related line (registers the target)
 import cudaq
 from classiq import (qfunc, QArray, QBit, Output, allocate,
                      RY, RZ, CX, synthesize, qprog_to_cudaq_kernel,

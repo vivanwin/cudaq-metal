@@ -131,15 +131,16 @@ communicate the result back.
 
 ## Reproducing
 
-```bash
-# 15-node warm-start QAOA, non-deterministic; run several times.
-../cudaq\ qaoa/.venv/bin/python benchmark/repro_realqaoa.py
-```
+The reproducer (a 15-node warm-start QAOA built with Classiq and evaluated
+with `cudaq.observe` on the metal target; failures are non-deterministic, so
+run it several times) was `benchmark/repro_realqaoa.py`. It was removed after
+the fix shipped in CUDA-Q 0.16 and is available in the git history at tag
+`v0.2.0`.
 
 ## Upstream ask (no longer needed — fixed in CUDA-Q 0.16)
 
-- File at https://github.com/NVIDIA/cuda-quantum with a minimal repro of
-  `benchmark/repro_realqaoa.py`.
+- File at https://github.com/NVIDIA/cuda-quantum with a minimal repro (the
+  reproducer described above).
 - Root cause is that `cudaq::QPU::rethrowDeferredKernelException()`
   (declared in `include/cudaq/platform/qpu.h`) does not fire (or its throw is
   swallowed) on the observe path in the current `DefaultQPU`. The deferred

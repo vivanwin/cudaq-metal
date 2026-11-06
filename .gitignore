@@ -5,17 +5,6 @@
 /build/
 *.o
 
-# nvq++ / compiled demo binaries (generated in-tree)
-build_ghz_qpp
-build_ghz_metal
-build_bench_qpp
-build_bench_metal
-build_standalone_bench
-*.qke
-*.qke.o
-*.classic.o
-*.qir.ll
-
 # Python
 __pycache__/
 *.pyc
@@ -23,6 +12,7 @@ __pycache__/
 venv/
 *.egg-info/
 /dist/
+.pytest_cache/
 
 # macOS
 .DS_Store
@@ -30,12 +20,8 @@ venv/
 # Editor / harness / stray temporaries
 .claude/
 *.tmp
-*.ll.tmp
+*.part
 
 # NOTE: cudaq_metal/data/libnvqir-metal.dylib IS committed on purpose — it is
 # the shipped, prebuilt backend. Refresh it with scripts/refresh_binary.sh
 # after changing the C++ sources or moving to a new CUDA-Q version.
-
-# Worker scripts that cudaq-metal <= 0.1 generated at runtime
-cudaq_metal/_worker.py
-cudaq_metal/_worker_transparent.py

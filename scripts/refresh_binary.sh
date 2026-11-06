@@ -1,23 +1,26 @@
 #!/bin/bash
-# Maintainer helper: rebuild the C++ backend, copy the fresh dylib + target
-# config into the pip package's bundled data, then build the wheel into dist/.
-# Run after changing anything under src/ or targets/, or when moving to a new
-# CUDA-Q version (also bump COMPATIBLE_CUDAQ in cudaq_metal/_install.py and the
-# cuda-quantum-cu13 pin in pyproject.toml).
+# Maintainer helper: rebuild the C++ backend, copy the fresh dylib into the pip
+# package's bundled data, then build the wheel into dist/. Run after changing
+# anything under src/, or when moving to a new CUDA-Q version (also bump
+# COMPATIBLE_CUDAQ in cudaq_metal/_install.py and the cuda-quantum-cu13 pin in
+# pyproject.toml).
+#
+# With an editable install (`pip install -e .`), the next `import cudaq_metal`
+# copies the refreshed dylib into cudaq automatically.
 #
 # Usage: scripts/refresh_binary.sh [PYTHON]   (env must have cudaq installed)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${1:-${PYTHON:-python3}}"
+source "$ROOT/scripts/_cudaq_env.sh"
+cudaq_env "$PY"
 
 echo ">> building backend ..."
 bash "$ROOT/scripts/build_backend.sh" "$PY"
-VER="$("$PY" -c 'import importlib.metadata as m, re; print(re.match(r"\d+\.\d+\.\d+", m.version("cuda-quantum-cu13")).group(0))')"
 
 echo ">> refreshing bundled artifacts ..."
-cp "$ROOT/build/cudaq-$VER/libnvqir-metal.dylib" "$ROOT/cudaq_metal/data/"
-cp "$ROOT/targets/metal.yml" "$ROOT/cudaq_metal/data/"
+cp "$ROOT/build/cudaq-$CUDAQ_VERSION/libnvqir-metal.dylib" "$ROOT/cudaq_metal/data/"
 
 echo ">> building wheel ..."
 rm -f "$ROOT"/dist/cudaq_metal-*.whl

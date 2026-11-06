@@ -3,7 +3,7 @@
 # ============================================================================ #
 
 name: metal
-description: "Naive Metal (Apple GPU) statevector simulator (fp32, single-target gates)."
+description: "Metal (Apple GPU) statevector simulator (fp32, gates with 1-4 targets)."
 config:
   nvqir-simulation-backend: metal
   # Metal has no fp64; the backend is CircuitSimulatorBase<float>, so tell the

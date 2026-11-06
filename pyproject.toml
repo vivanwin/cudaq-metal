@@ -31,6 +31,9 @@ classifiers = [
 # cudaq_metal/_install.py whenever the binary is rebuilt for a new CUDA-Q.
 dependencies = ["cuda-quantum-cu13>=0.16.0,<0.17"]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.scripts]
 cudaq-metal-install = "cudaq_metal._install:_main"
 
@@ -46,3 +49,7 @@ include = ["cudaq_metal*"]
 
 [tool.setuptools.package-data]
 cudaq_metal = ["data/*.dylib", "data/*.yml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:The CUDA-Q .* will change:FutureWarning"]

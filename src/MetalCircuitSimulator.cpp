@@ -4,49 +4,107 @@
  * Subclasses nvqir::CircuitSimulatorBase<float> (Metal has no fp64) and routes
  * gate application to a naive Apple-GPU statevector engine (see metal_sv.h).
  *
- * Qubit convention note: CUDA-Q's internal qubit indices are little-endian
- * (q0 = least-significant bit of the amplitude index), which is exactly the
- * convention the Metal engine uses. So — unlike the QPP backend, which is
- * big-endian internally and must convert every index — this backend needs NO
- * index conversion, and growing the state by a qubit is a plain low-half copy.
+ * Qubit convention: CUDA-Q's internal qubit indices are little-endian (q0 =
+ * least-significant bit of the amplitude index), exactly the convention the
+ * Metal engine uses, so — unlike the QPP backend — no index conversion is
+ * needed and growing the state by a qubit is a plain low-half copy.
  *
- * Sampling and single-qubit measurement are performed on the host by reading
- * the unified-memory amplitude buffer directly; because the buffer is shared,
- * collapsing the state in place is immediately visible to subsequent GPU gates.
+ * Sampling, expectation values and single-qubit measurement run on the host,
+ * on all cores, directly over the unified-memory amplitude buffer; because the
+ * buffer is shared, collapsing the state in place is immediately visible to
+ * subsequent GPU gates.
+ *
+ * Errors raised while a JIT-compiled kernel frame is on the stack go through
+ * deferOrThrowKernelException: on macOS arm64 a C++ throw cannot unwind
+ * through such a frame, so CUDA-Q stores the error and re-raises it once the
+ * kernel returns.
  ******************************************************************************/
 
 #include "nvqir/CircuitSimulator.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
+#include <complex>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <complex>
-#include <optional>
+#include <cstring>
+#include <numeric>
 #include <ostream>
 #include <random>
-#include <set>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <dispatch/dispatch.h>
 
 #include "metal_sv.h"
 
 namespace nvqir {
+namespace {
 
-/// @brief SimulationState for the Metal backend. Owns an fp32 copy of the
-/// statevector. The array uses CUDA-Q's canonical ordering (qubit q = bit q of
-/// the amplitude index), the same ordering qpp presents, so no reindexing is
-/// needed for get_state to agree with qpp-cpu.
-struct MetalSimState : public cudaq::SimulationState {
-  std::vector<std::complex<float>> state;
+using Complex = std::complex<float>;
 
-  MetalSimState() = default;
-  explicit MetalSimState(std::vector<std::complex<float>> s)
-      : state(std::move(s)) {}
+// std::complex<float> is guaranteed layout-compatible with float[2], which is
+// the interleaved-complex layout the engine takes.
+const float *asFloats(const Complex *c) {
+  return reinterpret_cast<const float *>(c);
+}
+
+// Run fn(i) for i in [0, n) on all cores.
+template <typename Fn>
+void parallelFor(std::size_t n, const Fn &fn) {
+  if (n == 1) {
+    fn(0);
+    return;
+  }
+  const Fn *f = &fn;
+  dispatch_apply(n, DISPATCH_APPLY_AUTO, ^(std::size_t i) { (*f)(i); });
+}
+
+// Host passes over the statevector are split into fixed-size chunks so they
+// parallelize and so per-chunk partial results stay small.
+constexpr std::size_t kChunk = std::size_t(1) << 16;
+
+std::size_t numChunks(std::size_t n) { return (n + kChunk - 1) / kChunk; }
+
+// Run fn(chunkIndex, begin, end) over [0, n) in chunks, on all cores.
+template <typename Fn>
+void forEachChunk(std::size_t n, const Fn &fn) {
+  parallelFor(numChunks(n), [&](std::size_t c) {
+    const std::size_t b = c * kChunk;
+    fn(c, b, std::min(b + kChunk, n));
+  });
+}
+
+} // namespace
+
+/// @brief SimulationState for the Metal backend (fp32, canonical qubit q =
+/// bit q ordering, the same ordering qpp presents). Either owns a host vector
+/// (state built from user data) or adopts the simulator's engine (state
+/// extracted with get_state), so extraction never copies 2^n amplitudes.
+class MetalSimState : public cudaq::SimulationState {
+  std::vector<Complex> owned;
+  MSVState *engine = nullptr;
+  Complex *amps = nullptr;
+  std::size_t dim = 0;
+
+public:
+  explicit MetalSimState(std::vector<Complex> data)
+      : owned(std::move(data)), amps(owned.data()), dim(owned.size()) {}
+  /// Takes ownership of `adopted`; `data` is its synchronized amplitude view.
+  MetalSimState(MSVState *adopted, Complex *data)
+      : engine(adopted), amps(data),
+        dim(std::size_t(1) << msv_num_qubits(adopted)) {}
+  MetalSimState(const MetalSimState &) = delete;
+  MetalSimState &operator=(const MetalSimState &) = delete;
+  ~MetalSimState() override { destroyState(); }
 
   std::size_t getNumQubits() const override {
-    return static_cast<std::size_t>(std::log2(static_cast<double>(state.size())));
+    return dim ? std::countr_zero(dim) : 0;
   }
 
   precision getPrecision() const override { return precision::fp32; }
@@ -54,8 +112,7 @@ struct MetalSimState : public cudaq::SimulationState {
   Tensor getTensor(std::size_t tensorIdx = 0) const override {
     if (tensorIdx != 0)
       throw std::runtime_error("[metal-state] invalid tensor requested.");
-    return Tensor{const_cast<void *>(reinterpret_cast<const void *>(state.data())),
-                  std::vector<std::size_t>{state.size()}, precision::fp32};
+    return Tensor{amps, std::vector<std::size_t>{dim}, precision::fp32};
   }
   std::vector<Tensor> getTensors() const override { return {getTensor()}; }
   std::size_t getNumTensors() const override { return 1; }
@@ -63,9 +120,9 @@ struct MetalSimState : public cudaq::SimulationState {
   std::complex<double>
   operator()(std::size_t tensorIdx,
              const std::vector<std::size_t> &indices) override {
-    if (tensorIdx != 0 || indices.size() != 1)
+    if (tensorIdx != 0 || indices.size() != 1 || indices[0] >= dim)
       throw std::runtime_error("[metal-state] invalid element extraction.");
-    return state[indices[0]];
+    return amps[indices[0]];
   }
 
   std::complex<double> getAmplitude(const std::vector<int> &basisState) override {
@@ -75,7 +132,7 @@ struct MetalSimState : public cudaq::SimulationState {
     std::size_t idx = 0;
     for (std::size_t i = 0; i < basisState.size(); ++i)
       if (basisState[i]) idx |= (std::size_t(1) << i); // qubit i -> bit i
-    return std::complex<double>(state[idx]);
+    return amps[idx];
   }
 
   std::complex<double> overlap(const cudaq::SimulationState &other) override {
@@ -84,90 +141,144 @@ struct MetalSimState : public cudaq::SimulationState {
       throw std::runtime_error("[metal-state] overlap: dimension mismatch.");
     std::complex<double> acc{0.0, 0.0};
     if (other.getPrecision() == precision::fp32) {
-      auto *o = reinterpret_cast<std::complex<float> *>(other.getTensor().data);
-      for (std::size_t i = 0; i < state.size(); ++i)
-        acc += std::complex<double>(state[i]) *
+      auto *o = static_cast<const Complex *>(other.getTensor().data);
+      for (std::size_t i = 0; i < dim; ++i)
+        acc += std::complex<double>(amps[i]) *
                std::conj(std::complex<double>(o[i]));
     } else {
-      auto *o = reinterpret_cast<std::complex<double> *>(other.getTensor().data);
-      for (std::size_t i = 0; i < state.size(); ++i)
-        acc += std::complex<double>(state[i]) * std::conj(o[i]);
+      auto *o = static_cast<const std::complex<double> *>(other.getTensor().data);
+      for (std::size_t i = 0; i < dim; ++i)
+        acc += std::complex<double>(amps[i]) * std::conj(o[i]);
     }
     return std::abs(acc);
   }
 
   std::unique_ptr<cudaq::SimulationState>
   createFromSizeAndPtr(std::size_t size, void *ptr, std::size_t) override {
-    auto *p = reinterpret_cast<std::complex<float> *>(ptr);
-    return std::make_unique<MetalSimState>(
-        std::vector<std::complex<float>>(p, p + size));
+    if (!std::has_single_bit(size))
+      throw std::runtime_error(
+          "[metal-state] state data length must be a power of two.");
+    auto *p = static_cast<const Complex *>(ptr);
+    return std::make_unique<MetalSimState>(std::vector<Complex>(p, p + size));
   }
 
   void dump(std::ostream &os) const override {
-    for (auto &a : state) os << a << "\n";
+    for (std::size_t i = 0; i < dim; ++i)
+      os << amps[i] << "\n";
   }
 
   void destroyState() override {
-    state.clear();
-    state.shrink_to_fit();
+    if (engine)
+      msv_destroy(engine);
+    engine = nullptr;
+    owned = {};
+    amps = nullptr;
+    dim = 0;
   }
 };
 
 class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
-  using ScalarType = float;
-  using Complex = std::complex<float>;
-
   MSVState *engine = nullptr;
   std::mt19937_64 rng{std::random_device{}()};
 
   int numQubitsFromDim() const {
     return stateDimension ? std::countr_zero(stateDimension) : 0;
   }
-
-  // Ensure the engine exists and holds exactly `n` qubits, preserving existing
-  // amplitudes when growing.
-  void ensureEngine(int n) {
-    if (n <= 0)
-      return;
-    if (!engine) {
-      engine = msv_create(n);
-      if (!engine)
-        throw std::runtime_error("[metal] failed to create Metal simulator "
-                                 "(no Metal device?)");
-      return;
-    }
-    int cur = msv_num_qubits(engine);
-    if (n > cur) {
-      msv_grow_to(engine, n);
-    } else if (n < cur) {
-      msv_destroy(engine);
-      engine = msv_create(n);
-    }
+  std::size_t engineDim() const {
+    return std::size_t(1) << msv_num_qubits(engine);
   }
 
+  static void fail(const std::string &msg) {
+    deferOrThrowKernelException("[metal] " + msg);
+  }
+
+  // Make the engine hold exactly `n` qubits, keeping existing amplitudes when
+  // growing. Returns false (after reporting the error) on failure.
+  bool ensureEngine(int n) {
+    if (engine && msv_num_qubits(engine) > n) {
+      msv_destroy(engine);
+      engine = nullptr;
+    }
+    const bool ok = engine ? msv_grow_to(engine, n) == 0
+                           : (engine = msv_create(n)) != nullptr;
+    if (!ok)
+      fail(msv_last_error());
+    return ok;
+  }
+
+  // Synchronize and return the host view of the amplitudes, or nullptr (after
+  // reporting the error) if there is no state or the GPU failed.
   Complex *amplitudes() {
-    return reinterpret_cast<Complex *>(msv_data(engine));
+    if (!engine)
+      return nullptr;
+    if (void *p = msv_data(engine))
+      return static_cast<Complex *>(p);
+    fail(msv_last_error());
+    return nullptr;
+  }
+
+  void applyMatrix(const Complex *mat, const std::vector<int> &targets,
+                   const std::vector<int> &controls) {
+    if (msv_apply(engine, asFloats(mat), static_cast<int>(targets.size()),
+                  targets.data(), controls.data(),
+                  static_cast<int>(controls.size())) != 0)
+      throw std::runtime_error(std::string("[metal] ") + msv_last_error());
+  }
+
+  // Initialize the qubits just allocated from `data` (2^k amplitudes): the
+  // result is |data> ⊗ |current>, the new qubits being the high-order bits.
+  void appendState(const Complex *data, std::size_t size) {
+    const int oldN = msv_num_qubits(engine), newN = numQubitsFromDim();
+    if (newN <= oldN || size != (std::size_t(1) << (newN - oldN))) {
+      fail("initial state has " + std::to_string(size) +
+           " amplitudes, expected 2^" + std::to_string(newN - oldN));
+      return;
+    }
+    if (!ensureEngine(newN))
+      return;
+    Complex *amp = amplitudes();
+    if (!amp)
+      return;
+    if (oldN == 0) {
+      std::memcpy(amp, data, size * sizeof(Complex));
+      return;
+    }
+    // Block j of the new state is data[j] * old. Block 0 holds the old state,
+    // so it is rewritten last.
+    const std::size_t oldDim = std::size_t(1) << oldN;
+    for (std::size_t j = size; j-- > 0;) {
+      const Complex c = data[j];
+      Complex *dst = amp + j * oldDim;
+      forEachChunk(oldDim, [&](std::size_t, std::size_t b, std::size_t e) {
+        for (std::size_t i = b; i < e; ++i)
+          dst[i] = c * amp[i];
+      });
+    }
   }
 
   // ---- Gate fusion ------------------------------------------------------
-  // Consecutive gates are greedily combined into a single dense unitary on the
-  // union of their qubits (up to kFuseMax qubits), then applied in ONE GPU pass
-  // instead of one pass per gate. On a bandwidth-bound statevector sim this is
-  // the dominant win for deep circuits: it cuts the number of full-statevector
-  // read/write passes. Controls are baked into the dense block, so fused blocks
-  // carry no control mask.
-  static constexpr int kFuseMax = 4; // matches the applykq kernel's max targets
-
+  // Consecutive gates are greedily combined into a single dense unitary when
+  // one gate's qubits are a subset of the other's (e.g. 1-qubit rotations
+  // absorbed into a 2-qubit block), then applied in ONE GPU pass instead of
+  // one pass per gate. A bandwidth-bound statevector sim gains directly from
+  // fewer full-statevector passes. Fusion never grows a block past the larger
+  // operand, which would multiply the per-thread dense-matmul cost. Controls
+  // are baked into the dense block, so fused blocks carry no control mask.
   struct DenseOp {
-    std::vector<int> qubits;              // sorted ascending
-    std::vector<Complex> mat;             // 2^m x 2^m, row-major; bit b -> qubits[b]
+    std::vector<int> qubits;  // sorted ascending
+    std::vector<Complex> mat; // 2^m x 2^m, row-major; bit b -> qubits[b]
   };
-  DenseOp group_;
-  bool haveGroup_ = false;
-  int groupCount_ = 0;                          // how many gates are in group_
-  std::optional<GateApplicationTask> groupSingle_; // the sole gate iff count==1
+  int groupSize_ = 0;             // gates in the pending group (0 = none)
+  std::uint64_t groupMask_ = 0;   // qubits the pending group acts on
+  DenseOp group_;                 // the fused block, valid iff groupSize_ >= 2
+  // A 1-gate group stays in sparse (control-mask) form: applying a lone CX as
+  // a dense 2-qubit block would only cost more. Buffers are reused, so
+  // holding a gate does not allocate once they have grown.
+  std::vector<Complex> loneMat_;
+  std::vector<int> loneTargets_, loneControls_;
+  std::vector<int> scratchTargets_, scratchControls_;
   // Set MSV_DISABLE_FUSION=1 to bypass fusion (for A/B benchmarking).
-  bool fuseEnabled_ = (std::getenv("MSV_DISABLE_FUSION") == nullptr);
+  const bool fuseEnabled_ = (std::getenv("MSV_DISABLE_FUSION") == nullptr);
 
   static int posIn(const std::vector<int> &v, int q) {
     return int(std::lower_bound(v.begin(), v.end(), q) - v.begin());
@@ -212,12 +323,11 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
     return C;
   }
 
-  // Turn a (possibly controlled) gate task into a dense op on sorted(controls
-  // + targets): identity unless all controls are 1, where task.matrix acts on
-  // the targets.
-  DenseOp denseFromTask(const GateApplicationTask &task) {
-    std::vector<int> tgt(task.targets.begin(), task.targets.end());
-    std::vector<int> S(task.controls.begin(), task.controls.end());
+  // Dense form of a (possibly controlled) gate on sorted(controls + targets):
+  // identity unless all controls are 1, where `mat` acts on the targets.
+  static DenseOp denseFrom(const Complex *mat, const std::vector<int> &tgt,
+                           const std::vector<int> &ctl) {
+    std::vector<int> S(ctl);
     S.insert(S.end(), tgt.begin(), tgt.end());
     std::sort(S.begin(), S.end());
     const int m = int(S.size()), nt = int(tgt.size());
@@ -225,7 +335,7 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
     std::vector<int> tpos(nt);
     for (int b = 0; b < nt; ++b) tpos[b] = posIn(S, tgt[b]);
     std::size_t cmask = 0;
-    for (int c : task.controls) cmask |= (std::size_t(1) << posIn(S, c));
+    for (int c : ctl) cmask |= (std::size_t(1) << posIn(S, c));
     std::vector<Complex> M(dim * dim, Complex(0, 0));
     for (std::size_t r = 0; r < dim; ++r) {
       if ((r & cmask) != cmask) { M[r * dim + r] = Complex(1, 0); continue; }
@@ -238,99 +348,105 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
         std::size_t c = rRest;
         for (int b = 0; b < nt; ++b)
           if (cTgt & (std::size_t(1) << b)) c |= (std::size_t(1) << tpos[b]);
-        M[r * dim + c] = task.matrix[rTgt * dt + cTgt];
+        M[r * dim + c] = mat[rTgt * dt + cTgt];
       }
     }
     return DenseOp{std::move(S), std::move(M)};
   }
 
-  void flushGroup() {
-    if (!haveGroup_) return;
-    // A group of a single gate is applied via its original (possibly sparse,
-    // control-masked) form — converting a lone CX/rotation into a dense block
-    // would be pure overhead. Only genuinely fused (>=2 gate) blocks go dense.
-    if (groupCount_ == 1 && groupSingle_) {
-      applyDirect(*groupSingle_);
-    } else {
-      const int m = int(group_.qubits.size());
-      std::vector<float> mi(group_.mat.size() * 2);
-      for (std::size_t i = 0; i < group_.mat.size(); ++i) {
-        mi[2 * i] = group_.mat[i].real();
-        mi[2 * i + 1] = group_.mat[i].imag();
-      }
-      if (m == 1)
-        msv_apply_1q(engine, mi.data(), group_.qubits[0], nullptr, 0);
-      else
-        msv_apply_kq(engine, mi.data(), m, group_.qubits.data(), m, nullptr, 0);
-    }
-    haveGroup_ = false;
-    groupCount_ = 0;
-    groupSingle_.reset();
-    group_.qubits.clear();
-    group_.mat.clear();
+  // Apply a gate straight to the engine (control-mask path), no fusion.
+  void applyTask(const GateApplicationTask &task) {
+    scratchTargets_.assign(task.targets.begin(), task.targets.end());
+    scratchControls_.assign(task.controls.begin(), task.controls.end());
+    applyMatrix(task.matrix.data(), scratchTargets_, scratchControls_);
   }
 
-  void startGroup(const GateApplicationTask &task) {
-    group_ = denseFromTask(task);
-    haveGroup_ = true;
-    groupCount_ = 1;
-    groupSingle_.emplace(task);
-  }
-
-  void fuseIn(const GateApplicationTask &task) {
-    if (!haveGroup_) { startGroup(task); return; }
-    DenseOp op = denseFromTask(task);
+  // Fold `task` (acting on qubit set `u` together with the group) into the
+  // pending group.
+  void fuse(const GateApplicationTask &task, std::uint64_t u) {
     std::vector<int> U;
-    std::set_union(group_.qubits.begin(), group_.qubits.end(), op.qubits.begin(),
-                   op.qubits.end(), std::back_inserter(U));
-    // Only fuse when the union is no bigger than the larger operand, i.e. one
-    // gate's qubits are a subset of the other's. This absorbs cheap gates
-    // (e.g. 1-qubit rotations into a 2-qubit block) for free, without growing
-    // the block size — which would multiply the per-thread dense-matmul cost
-    // and can be a net loss for already-dense gates.
-    const int maxOperand = std::max(group_.qubits.size(), op.qubits.size());
-    if (int(U.size()) > maxOperand) {
-      flushGroup();
-      startGroup(task);
+    for (int q = 0; (u >> q) != 0; ++q)
+      if ((u >> q) & 1)
+        U.push_back(q);
+    if (groupSize_ == 1)
+      group_ = denseFrom(loneMat_.data(), loneTargets_, loneControls_);
+    scratchTargets_.assign(task.targets.begin(), task.targets.end());
+    scratchControls_.assign(task.controls.begin(), task.controls.end());
+    const DenseOp op =
+        denseFrom(task.matrix.data(), scratchTargets_, scratchControls_);
+    const auto g = embed(group_, U), o = embed(op, U);
+    group_.mat = matmul(o, g, std::size_t(1) << U.size()); // task after group
+    group_.qubits = std::move(U);
+    groupMask_ = u;
+    ++groupSize_;
+  }
+
+  void flushGroup() {
+    const int size = groupSize_;
+    groupSize_ = 0; // reset first: a failed apply must not be retried
+    if (size == 1)
+      applyMatrix(loneMat_.data(), loneTargets_, loneControls_);
+    else if (size > 1)
+      applyMatrix(group_.mat.data(), group_.qubits, {});
+  }
+
+  void discardGroup() { groupSize_ = 0; }
+
+  // Tripwire for a silently-dropped kernel. While an error raised inside a
+  // JIT kernel frame is stashed on the ExecutionContext, `enqueueGate` and
+  // `flushGateQueueImpl` are no-ops, so the kernel's gates are never applied.
+  // CUDA-Q 0.16 re-raises the stashed error when the kernel returns; on
+  // CUDA-Q <= 0.15 on Darwin arm64 it often did not, and sampling silently
+  // returned the untouched |0..0> state (see BUG_INVESTIGATION.md). We warn so
+  // a regression is loud. It only warns: it does not throw, inspect or clear
+  // the stashed exception — all three crashed in the 0.15 failure mode.
+  static void checkNotSilentlyDeferred(const char *op) {
+    if (!kernelExecutionDeferred())
       return;
-    }
-    const std::size_t dim = std::size_t(1) << U.size();
-    auto Fg = embed(group_, U);
-    auto Og = embed(op, U);
-    group_ = DenseOp{std::move(U), matmul(Og, Fg, dim)}; // op applied after group
-    haveGroup_ = true;
-    ++groupCount_;
-    groupSingle_.reset(); // no longer a lone gate
+    fprintf(stderr,
+            "[metal] WARNING: %s() is reading a state whose gates were skipped "
+            "because an error was raised inside this kernel, so this result is "
+            "meaningless.\n"
+            "  CUDA-Q normally re-raises that error as soon as the kernel "
+            "returns. If no error follows, you have hit the silent-|0..0> bug "
+            "of CUDA-Q <= 0.15 on Darwin arm64; please report it at "
+            "https://github.com/vivanwin/cudaq-metal/issues\n",
+            op);
   }
 
 protected:
-  /// @brief Grow the state by one qubit (new qubit is the high bit, |0>).
   void addQubitToState() override { addQubitsToState(1); }
 
   /// @brief Allocate/grow the state. `stateDimension` has already been updated
   /// by the base class to reflect the new total qubit count.
   void addQubitsToState(std::size_t qubitCount,
                         const void *stateDataIn = nullptr) override {
-
     if (qubitCount == 0)
       return;
-    const int newN = numQubitsFromDim();
-    const bool firstAlloc = (engine == nullptr);
-    ensureEngine(newN);
-    if (stateDataIn) {
-      if (!firstAlloc)
-        throw std::runtime_error("[metal] initializing appended qubits from "
-                                 "explicit state data is not supported.");
-      std::memcpy(amplitudes(), stateDataIn, stateDimension * sizeof(Complex));
-    }
+    if (stateDataIn)
+      appendState(static_cast<const Complex *>(stateDataIn),
+                  std::size_t(1) << qubitCount);
+    else
+      ensureEngine(numQubitsFromDim());
   }
 
-  void discardGroup() {
-    haveGroup_ = false;
-    groupCount_ = 0;
-    groupSingle_.reset();
-    group_.qubits.clear();
-    group_.mat.clear();
+  /// @brief Allocate qubits initialized from an existing state (e.g. one
+  /// returned by cudaq.get_state or built with cudaq.State.from_data).
+  void addQubitsToState(const cudaq::SimulationState &state) override {
+    if (!state.isArrayLike() || state.getNumTensors() != 1 ||
+        state.getTensor().get_rank() != 1) {
+      fail("qubits can only be initialized from a state vector");
+      return;
+    }
+    const auto t = state.getTensor();
+    const std::size_t size = t.get_num_elements();
+    if (t.fp_precision == cudaq::SimulationState::precision::fp32) {
+      appendState(static_cast<const Complex *>(t.data), size);
+    } else {
+      auto *d = static_cast<const std::complex<double> *>(t.data);
+      const std::vector<Complex> converted(d, d + size);
+      appendState(converted.data(), size);
+    }
   }
 
   /// @brief Free the device state.
@@ -342,140 +458,102 @@ protected:
     }
   }
 
-  /// @brief Apply a gate. Only single-target gates (with any number of
-  /// controls) are supported so far — enough for H/X/Z/rotations and
-  /// (multi-)controlled-X/Z, i.e. GHZ and most textbook circuits.
-  int gateCount_ = 0;
-
-  // Tripwire for a silently-dropped kernel. cudaq's
-  // `deferOrThrowKernelException` stashes exceptions raised inside a JIT frame
-  // on the ExecutionContext; while one is stashed, `enqueueGate` and
-  // `flushGateQueueImpl` are no-ops, so the kernel's gates are never applied
-  // and sampling reads the untouched |0..0> state — a silently wrong answer.
-  // On CUDA-Q <= 0.15 this happened routinely on Darwin arm64 (see
-  // BUG_INVESTIGATION.md); 0.16 fixed it (0 wrong results in 1050 observes
-  // across 35 fresh processes). We keep this check so a regression is loud
-  // instead of silent.
-  //
-  // It only warns: it does not throw (a throw inside a JIT launch frame hits
-  // the same unwinder problem and terminates the process) and it does not
-  // clear the stashed exception (clearing from under the runtime crashed
-  // cudaq's finalization path when we tried it on 0.15).
-  static void checkNotSilentlyDeferred(const char *op) {
-    if (!kernelExecutionDeferred())
-      return;
-    fprintf(stderr,
-            "\n\n==============================================================================\n"
-            "  [metal] WARNING: %s() called with a deferred kernel exception.\n"
-            "  cudaq discarded this kernel's gate queue (no gates were applied),\n"
-            "  so the state is the untouched |0..0> and any result computed from\n"
-            "  it is WRONG. Restart the Python process and re-run.\n"
-            "  This was a known CUDA-Q bug on Darwin arm64, fixed in CUDA-Q 0.16;\n"
-            "  seeing it again means a regression. Please report it at\n"
-            "  https://github.com/vivanwin/cudaq-metal/issues\n"
-            "==============================================================================\n\n",
-            op);
-  }
   void applyGate(const GateApplicationTask &task) override {
-    const int nT = static_cast<int>(task.targets.size());
-    ++gateCount_;
-    if (gateCount_ <= 5 || gateCount_ % 100 == 0) {
-      std::string tgts;
-      for (auto t : task.targets) tgts += std::to_string(t) + ",";
-      std::string ctrls;
-      for (auto c : task.controls) ctrls += std::to_string(c) + ",";
-    }
-    if (nT < 1 || nT > 4)
+    const int k = static_cast<int>(task.targets.size());
+    if (k < 1 || k > MSV_MAX_TARGETS)
       throw std::runtime_error(
-          "[metal] gates with " + std::to_string(nT) +
-          " targets are not supported (max 4) for op '" + task.operationName +
-          "'.");
-    // If controls+targets span more than a fused block, it can't become a
-    // dense <=kFuseMax block: flush the pending group and apply it directly
-    // with a control mask.
-    if (!fuseEnabled_) { applyDirect(task); return; }
-    std::set<int> span(task.targets.begin(), task.targets.end());
-    span.insert(task.controls.begin(), task.controls.end());
-    if (static_cast<int>(span.size()) > kFuseMax) {
+          "[metal] gates with " + std::to_string(k) +
+          " targets are not supported (max " + std::to_string(MSV_MAX_TARGETS) +
+          ") for op '" + task.operationName + "'.");
+    std::uint64_t mask = 0;
+    for (auto q : task.targets) mask |= std::uint64_t(1) << q;
+    for (auto q : task.controls) mask |= std::uint64_t(1) << q;
+    // Gates too wide for a dense block (or every gate, with fusion off) go
+    // straight to the engine with a control mask.
+    if (!fuseEnabled_ || std::popcount(mask) > MSV_MAX_TARGETS) {
       flushGroup();
-      applyDirect(task);
+      applyTask(task);
       return;
     }
-    fuseIn(task);
-  }
-
-  // Apply a gate straight to the engine (control-mask path), no fusion.
-  void applyDirect(const GateApplicationTask &task) {
-    const int nT = static_cast<int>(task.targets.size());
-    std::vector<float> m(task.matrix.size() * 2);
-    for (std::size_t i = 0; i < task.matrix.size(); ++i) {
-      m[2 * i] = task.matrix[i].real();
-      m[2 * i + 1] = task.matrix[i].imag();
+    if (groupSize_ > 0) {
+      const std::uint64_t u = groupMask_ | mask;
+      if (std::popcount(u) <= std::max(std::popcount(groupMask_), std::popcount(mask))) {
+        fuse(task, u);
+        return;
+      }
+      flushGroup();
     }
-    std::vector<int> ctrls(task.controls.begin(), task.controls.end());
-    if (nT == 1) {
-      msv_apply_1q(engine, m.data(), static_cast<int>(task.targets[0]),
-                   ctrls.data(), static_cast<int>(ctrls.size()));
-    } else {
-      std::vector<int> tgts(task.targets.begin(), task.targets.end());
-      msv_apply_kq(engine, m.data(), nT, tgts.data(), nT, ctrls.data(),
-                   static_cast<int>(ctrls.size()));
-    }
+    loneMat_.assign(task.matrix.begin(), task.matrix.end());
+    loneTargets_.assign(task.targets.begin(), task.targets.end());
+    loneControls_.assign(task.controls.begin(), task.controls.end());
+    groupMask_ = mask;
+    groupSize_ = 1;
   }
 
   // Called by the base at the end of every flushGateQueue(): apply any pending
   // fused block, then make sure the GPU has finished.
   void synchronize() override {
-    flushGroup();
-    if (engine)
-      msv_synchronize(engine);
+    try {
+      flushGroup();
+    } catch (const std::exception &e) {
+      deferOrThrowKernelException(e.what());
+      return;
+    }
+    if (engine && msv_synchronize(engine) != 0)
+      fail(msv_last_error());
   }
 
   /// @brief Reset the current state back to |0...0>.
   void setToZeroState() override {
     discardGroup();
     const int n = numQubitsFromDim();
-    if (n == 0) {
+    if (n == 0)
       deallocateStateImpl();
-      return;
-    }
-    ensureEngine(n);
-    msv_reset(engine);
+    else if (ensureEngine(n))
+      msv_reset(engine);
   }
 
   /// @brief Measure a single qubit, collapsing the state.
   bool measureQubit(const std::size_t index) override {
     flushGateQueue(); // apply any pending fused block first
     Complex *amp = amplitudes();
-    const std::size_t dim = std::size_t(1) << msv_num_qubits(engine);
-    const std::size_t bit = std::size_t(1) << index;
+    if (!amp)
+      return false;
+    const std::size_t dim = engineDim(), bit = std::size_t(1) << index;
 
-    double p1 = 0.0;
-    for (std::size_t i = 0; i < dim; ++i)
-      if (i & bit)
-        p1 += std::norm(amp[i]);
-
-    std::uniform_real_distribution<double> U(0.0, 1.0);
-    const bool outcome = U(rng) < p1;
-    const double pOut = outcome ? p1 : (1.0 - p1);
-    const float inv = pOut > 0.0 ? static_cast<float>(1.0 / std::sqrt(pOut)) : 0.0f;
-    for (std::size_t i = 0; i < dim; ++i) {
-      if (static_cast<bool>(i & bit) == outcome)
-        amp[i] *= inv;
-      else
-        amp[i] = Complex(0.0f, 0.0f);
+    std::vector<std::array<double, 2>> part(numChunks(dim));
+    forEachChunk(dim, [&](std::size_t c, std::size_t b, std::size_t e) {
+      double p[2] = {0.0, 0.0};
+      for (std::size_t i = b; i < e; ++i)
+        p[(i & bit) != 0] += std::norm(amp[i]);
+      part[c] = {p[0], p[1]};
+    });
+    double p0 = 0.0, p1 = 0.0;
+    for (const auto &p : part) {
+      p0 += p[0];
+      p1 += p[1];
     }
-    return outcome;
+    if (!(p0 + p1 > 0.0))
+      throw std::runtime_error("[metal] cannot measure a zero-norm state.");
+
+    // Draw against the actual total instead of assuming |psi| = 1: with fp32
+    // drift, 1 - p1 is not p0 and could select an impossible outcome.
+    std::uniform_real_distribution<double> U(0.0, p0 + p1);
+    const bool one = p0 == 0.0 || (p1 > 0.0 && U(rng) < p1);
+    const float scale = static_cast<float>(1.0 / std::sqrt(one ? p1 : p0));
+    forEachChunk(dim, [&](std::size_t, std::size_t b, std::size_t e) {
+      for (std::size_t i = b; i < e; ++i)
+        amp[i] = (((i & bit) != 0) == one) ? amp[i] * scale : Complex(0, 0);
+    });
+    return one;
   }
 
   /// @brief Reset a qubit to |0> (measure, then flip if it was |1>).
   void resetQubit(const std::size_t index) override {
-    flushGateQueue();
-    if (measureQubit(index)) {
-      static const float X[8] = {0, 0, 1, 0, 1, 0, 0, 0};
-      msv_apply_1q(engine, X, static_cast<int>(index), nullptr, 0);
-      msv_synchronize(engine);
-    }
+    if (!measureQubit(index)) // flushes pending gates first
+      return;
+    static const Complex X[4] = {{0, 0}, {1, 0}, {1, 0}, {0, 0}};
+    applyMatrix(X, {static_cast<int>(index)}, {});
   }
 
   QubitOrdering getQubitOrdering() const override {
@@ -484,7 +562,7 @@ protected:
 
 public:
   MetalCircuitSimulator() { summaryData.name = name(); }
-  virtual ~MetalCircuitSimulator() {
+  ~MetalCircuitSimulator() override {
     if (engine)
       msv_destroy(engine);
   }
@@ -499,53 +577,98 @@ public:
                                 bool includeSequentialData = true) override {
     checkNotSilentlyDeferred("sample");
     flushGateQueue(); // apply any pending fused block first
+    const Complex *amp = amplitudes();
+    if (!amp)
+      return {};
+    const std::size_t dim = engineDim(), nc = numChunks(dim);
 
-    Complex *amp = amplitudes();
-    const std::size_t dim = std::size_t(1) << msv_num_qubits(engine);
-    {
-      double totalNorm = 0.0;
-      int nonzeroCount = 0;
-      for (std::size_t i = 0; i < dim; ++i) {
-        double n = std::norm(amp[i]);
-        totalNorm += n;
-        if (n > 1e-12) ++nonzeroCount;
-      }
-    }
-
-    // Expectation-value path (used by observe when no shots).
+    // Expectation-value path (used by observe when no shots), normalized by
+    // the actual norm so fp32 drift does not bias it.
     if (shots < 1) {
       std::size_t mask = 0;
       for (auto q : qubits)
         mask |= (std::size_t(1) << q);
-      double ev = 0.0;
-      for (std::size_t i = 0; i < dim; ++i) {
-        double p = std::norm(amp[i]);
-        ev += (std::popcount(i & mask) & 1) ? -p : p;
+      std::vector<std::array<double, 2>> part(nc);
+      forEachChunk(dim, [&](std::size_t c, std::size_t b, std::size_t e) {
+        double norm = 0.0, z = 0.0;
+        for (std::size_t i = b; i < e; ++i) {
+          const double p = std::norm(amp[i]);
+          norm += p;
+          z += (std::popcount(i & mask) & 1) ? -p : p;
+        }
+        part[c] = {norm, z};
+      });
+      double norm = 0.0, z = 0.0;
+      for (const auto &p : part) {
+        norm += p[0];
+        z += p[1];
       }
-      return cudaq::ExecutionResult{{}, ev};
+      return cudaq::ExecutionResult{{}, norm > 0.0 ? z / norm : 0.0};
     }
 
-    // Build a cumulative distribution over basis states and inverse-CDF sample.
-    std::vector<double> cdf(dim);
-    double running = 0.0;
-    for (std::size_t i = 0; i < dim; ++i) {
-      running += std::norm(amp[i]);
-      cdf[i] = running;
+    // Inverse-CDF sampling without a 2^n CDF: per-chunk probability totals,
+    // sorted uniform draws, then a parallel scan of only the chunks that
+    // received shots. Extra memory is O(shots + 2^n / kChunk).
+    std::vector<double> cum(nc);
+    forEachChunk(dim, [&](std::size_t c, std::size_t b, std::size_t e) {
+      double s = 0.0;
+      for (std::size_t i = b; i < e; ++i)
+        s += std::norm(amp[i]);
+      cum[c] = s;
+    });
+    std::partial_sum(cum.begin(), cum.end(), cum.begin());
+    const double total = cum.back();
+    if (!(total > 0.0)) {
+      fail("cannot sample a zero-norm state.");
+      return {};
     }
-    std::uniform_real_distribution<double> U(0.0, running);
+    std::uniform_real_distribution<double> U(0.0, total);
+    std::vector<double> u(shots);
+    for (auto &x : u)
+      x = U(rng);
+    std::sort(u.begin(), u.end());
 
-    const std::size_t m = qubits.size();
+    struct Hit { std::size_t chunk, first, last; }; // shots [first, last)
+    std::vector<Hit> hits;
+    for (std::size_t s = 0; s < u.size();) {
+      const std::size_t c = std::min<std::size_t>(
+          std::upper_bound(cum.begin(), cum.end(), u[s]) - cum.begin(), nc - 1);
+      std::size_t e = s + 1;
+      while (e < u.size() && u[e] < cum[c])
+        ++e;
+      hits.push_back({c, s, e});
+      s = e;
+    }
+    std::vector<std::size_t> idx(shots);
+    parallelFor(hits.size(), [&](std::size_t h) {
+      const Hit &hit = hits[h];
+      const std::size_t b = hit.chunk * kChunk, e = std::min(b + kChunk, dim);
+      double running = hit.chunk ? cum[hit.chunk - 1] : 0.0;
+      std::size_t s = hit.first, last = b;
+      for (std::size_t i = b; i < e && s < hit.last; ++i) {
+        const double p = std::norm(amp[i]);
+        if (p == 0.0)
+          continue;
+        running += p;
+        last = i;
+        while (s < hit.last && u[s] < running)
+          idx[s++] = i;
+      }
+      while (s < hit.last) // rounding at the chunk's upper edge
+        idx[s++] = last;
+    });
+
+    // idx is sorted, so equal outcomes are adjacent: count them in runs.
     std::unordered_map<std::string, std::size_t> local;
-    std::string bits(m, '0');
-    for (int s = 0; s < shots; ++s) {
-      double u = U(rng);
-      std::size_t idx =
-          std::lower_bound(cdf.begin(), cdf.end(), u) - cdf.begin();
-      if (idx >= dim)
-        idx = dim - 1;
-      for (std::size_t j = 0; j < m; ++j)
-        bits[j] = ((idx >> qubits[j]) & 1) ? '1' : '0';
-      ++local[bits];
+    std::string bits(qubits.size(), '0');
+    for (std::size_t s = 0; s < idx.size();) {
+      std::size_t e = s + 1;
+      while (e < idx.size() && idx[e] == idx[s])
+        ++e;
+      for (std::size_t j = 0; j < qubits.size(); ++j)
+        bits[j] = ((idx[s] >> qubits[j]) & 1) ? '1' : '0';
+      local[bits] += e - s;
+      s = e;
     }
 
     cudaq::ExecutionResult counts;
@@ -563,21 +686,23 @@ public:
   }
 
   /// @brief Expose the current statevector for cudaq::get_state() etc.
-  /// Returns an fp32 copy of the amplitudes in canonical (qubit q = bit q) order.
   std::unique_ptr<cudaq::SimulationState> getSimulationState() override {
     checkNotSilentlyDeferred("get_state");
     flushGateQueue();
-    if (!engine)
-      return std::make_unique<MetalSimState>();
-    const Complex *amp = amplitudes(); // syncs the GPU
-    const std::size_t dim = std::size_t(1) << msv_num_qubits(engine);
-    return std::make_unique<MetalSimState>(
-        std::vector<Complex>(amp, amp + dim));
+    Complex *amp = amplitudes();
+    if (!amp)
+      return std::make_unique<MetalSimState>(std::vector<Complex>{});
+    // Zero-copy hand-off: the base deallocates the simulator state right after
+    // this call (finalizeExecutionContext), so the returned state adopts the
+    // engine instead of copying 2^n amplitudes and doubling peak memory.
+    auto state = std::make_unique<MetalSimState>(engine, amp);
+    engine = nullptr;
+    return state;
   }
 
   std::unique_ptr<cudaq::SimulationState>
   createStateFromData(const cudaq::state_data &data) override {
-    return std::make_unique<MetalSimState>()->createFromData(data);
+    return MetalSimState(std::vector<Complex>{}).createFromData(data);
   }
 
   std::string name() const override { return "metal"; }

@@ -2,10 +2,10 @@
 
 Times cudaq.get_state (pure simulation) on the metal backend for several
 representative circuits. Run twice to A/B fusion:
-    ~/.cudaq-metal/venv/bin/python benchmark/fusion_impact.py            # fusion ON
-    MSV_DISABLE_FUSION=1 ~/.cudaq-metal/venv/bin/python benchmark/fusion_impact.py  # OFF
+    python benchmarks/fusion_impact.py [n]                         # fusion ON
+    MSV_DISABLE_FUSION=1 python benchmarks/fusion_impact.py [n]    # fusion OFF
 
-Circuits (all compiled to 1-qubit + CX gates, as any real backend would):
+Circuits:
   trotter_tfim  : Hamiltonian-sim step, rzz = CX-Rz-CX + rx  (fuses very well)
   hw_efficient  : VQE/QML ansatz, Ry layer then CX ladder     (order-limited)
   brickwork_su4 : dense random SU(4) on pairs                  (nothing to absorb)
@@ -15,6 +15,7 @@ import sys
 import time
 
 import numpy as np
+import cudaq_metal  # noqa: F401  (registers the target; must precede cudaq)
 import cudaq
 
 rng = np.random.default_rng(3)
