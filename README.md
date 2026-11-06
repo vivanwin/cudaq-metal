@@ -4,24 +4,35 @@ A naive Apple-Silicon Metal statevector simulator exposed as a CUDA-Q / NVQIR
 backend. `import cudaq_metal` and your existing CUDA-Q code runs on the Apple
 GPU with `cudaq.set_target("metal")`. No new API, no code restructuring.
 
+> **Unofficial.** This is an independent community project, not affiliated
+> with or endorsed by NVIDIA. CUDA-Q is NVIDIA's; this package only plugs a
+> Metal simulator into it.
+
 > **🤖 Built entirely with Anthropic's Claude Code.**  
 > Every line of C++, Objective-C++, Python, CMake, MSL, tests, benchmarks,
 > commits, docs — this file included — was designed and implemented in a
 > pair-programming session with Claude. Author-of-record: [@vivanwin](https://github.com/vivanwin);
-> co-author on every commit: `Claude Opus 4.7 <noreply@anthropic.com>`.
+> co-author on every commit: Claude (Anthropic), see the `Co-Authored-By` trailers.
 > Read the [BUG_INVESTIGATION.md](BUG_INVESTIGATION.md) for the deep-dive that
 > traced a real upstream bug in CUDA-Q's Darwin arm64 JIT.
 
 ## Install
 
 ```bash
-pip install cudaq==0.15.0
+pip install cudaq==0.16.0
 pip install git+https://github.com/vivanwin/cudaq-metal.git
 ```
 
-- Apple Silicon macOS (arm64) with a Metal GPU.
-- CUDA-Q 0.15.x (the shipped `libnvqir-metal.dylib` is ABI-matched to that).
-- Classiq ≥ 1.2 recommended if you use `qprog_to_cudaq_kernel` (this is where
+- **Apple Silicon Mac (arm64), macOS 13 or newer** — the same floor as the
+  cudaq wheels. The wheel is tagged `macosx_13_0_arm64`, so pip refuses it on
+  Linux, Windows and Intel Macs.
+- **Python 3.11–3.14.**
+- **CUDA-Q 0.16.x.** The bundled `libnvqir-metal.dylib` is ABI-matched to it
+  (the package depends on `cuda-quantum-cu13>=0.16,<0.17`, the binary behind
+  `pip install cudaq` on macOS). Pin `cudaq==0.16.0`: the newer
+  `cudaq==0.16.0.post1` can't be installed on macOS because it requires a
+  `cuda-quantum-cu13==0.16.0.post1` that NVIDIA only published for Linux.
+- Classiq (tested with 1.34) if you use `qprog_to_cudaq_kernel` (this is where
   the transparent VQE reliability layer kicks in).
 
 ## Use it
@@ -100,10 +111,29 @@ python benchmarks/plot_examples.py
 | `src/metal_sv.{h,mm}` | Metal statevector engine (C-ABI, Objective-C++). One unified-memory MTLBuffer, fast `apply1q` and `apply2q` kernels + general `applykq` up to 4 targets, lazy command-buffer batching, strictly-beneficial gate fusion. |
 | `src/MetalCircuitSimulator.cpp` | The NVQIR backend: `CircuitSimulatorBase<float>` subclass. Implements sample, `get_state`, single-qubit measurement, and the Darwin-arm64 deferred-exception guard. |
 | `targets/metal.yml` | CUDA-Q target config (fp32). |
+| `scripts/` | Build tooling: `fetch_cudaq_headers.py` (pulls the ~0.7 MB of CUDA-Q headers the plugin needs from the matching source tag), `build_backend.sh`, `refresh_binary.sh` (rebuild + bundle + wheel). |
 | `cudaq_metal/` | Python package. Auto-installs the plugin on import, monkey-patches `cudaq.observe` for transparent worker-subprocess reliability. Exports `ReliableObserver` as an explicit escape hatch. |
 | `benchmarks/` | Reproducible benchmark script + measured CSV + plot generator. |
 | `examples/` | Small end-to-end examples. |
 | `BUG_INVESTIGATION.md` | Root-cause deep-dive on the upstream CUDA-Q Darwin arm64 bug and every workaround we tried. |
+
+## Building from source
+
+Only needed when changing the C++/Metal code or moving to a new CUDA-Q
+version. Requires Xcode command-line tools and CMake (Ninja optional):
+
+```bash
+pip install cudaq==0.16.0
+bash scripts/refresh_binary.sh "$(which python)"
+```
+
+That reads the CUDA-Q version from the active environment, fetches the
+matching C++ headers from the cuda-quantum source tag (the macOS wheel stopped
+shipping them in 0.16, and the full toolkit installer is ~630 MB), builds the
+plugin against the wheel's own libraries, copies it into `cudaq_metal/data/`
+and writes the wheel to `dist/`. For a new CUDA-Q minor version also bump
+`COMPATIBLE_CUDAQ` in `cudaq_metal/_install.py` and the `cuda-quantum-cu13`
+pin in `pyproject.toml`.
 
 ## Escape hatches
 

@@ -1,30 +1,44 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cudaq-metal"
-version = "0.1.0"
-description = "Naive Metal (Apple GPU) statevector backend for NVIDIA CUDA-Q on Apple Silicon"
+version = "0.2.0"
+description = "Unofficial Metal (Apple GPU) statevector simulator backend for NVIDIA CUDA-Q on Apple Silicon Macs"
 readme = "README.md"
-requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Vincent" }]
-keywords = ["cudaq", "quantum", "simulator", "metal", "apple-silicon"]
+keywords = ["cudaq", "cuda-quantum", "quantum", "simulator", "metal", "apple-silicon", "gpu"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
     "Environment :: GPU",
-    "Operating System :: MacOS",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
-# cudaq is an expected peer dependency but intentionally NOT pinned here so this
-# package can install into an environment that already has a matching cudaq.
-# The bundled binary is ABI-matched to cudaq 0.15.x (see cudaq_metal._install).
+# The bundled libnvqir-metal.dylib is ABI-matched to one CUDA-Q minor version.
+# On macOS `pip install cudaq` resolves to the cuda-quantum-cu13 binary wheel,
+# so that is the distribution we pin. Bump together with COMPATIBLE_CUDAQ in
+# cudaq_metal/_install.py whenever the binary is rebuilt for a new CUDA-Q.
+dependencies = ["cuda-quantum-cu13>=0.16.0,<0.17"]
 
 [project.scripts]
 cudaq-metal-install = "cudaq_metal._install:_main"
 
 [project.urls]
-Homepage = "https://github.com/NVIDIA/cuda-quantum"
+Homepage = "https://github.com/vivanwin/cudaq-metal"
+Repository = "https://github.com/vivanwin/cudaq-metal"
+Issues = "https://github.com/vivanwin/cudaq-metal/issues"
+"CUDA-Q (upstream)" = "https://github.com/NVIDIA/cuda-quantum"
 
 [tool.setuptools.packages.find]
 where = ["."]
