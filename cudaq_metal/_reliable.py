@@ -212,10 +212,8 @@ class ReliableObserver:
         existing_pp = env.get("PYTHONPATH", "")
         merged = list(self.extra_pythonpath) + ([existing_pp] if existing_pp else [])
         env["PYTHONPATH"] = os.pathsep.join(p for p in merged if p)
-        script_path = os.path.join(os.path.dirname(__file__), "_worker.py")
-        # Force-refresh worker script whenever module version bumps — cheap.
-        with open(script_path, "w") as f:
-            f.write(_WORKER_SOURCE)
+        from ._workerfile import worker_script
+        script_path = worker_script("reliable_worker", _WORKER_SOURCE)
         self._proc = subprocess.Popen(
             [self.python, script_path, self.target, str(self.max_in_process_retries)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,

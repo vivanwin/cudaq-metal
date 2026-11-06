@@ -187,10 +187,8 @@ class _TransparentWorkerPool:
         # Prevent the worker from auto-enabling transparent mode (would recurse
         # into another subprocess spawn on every observe call).
         env["_CUDAQ_METAL_WORKER"] = "1"
-        script_path = os.path.join(os.path.dirname(__file__), "_worker_transparent.py")
-        if not os.path.exists(script_path):
-            with open(script_path, "w") as f:
-                f.write(_WORKER_SOURCE)
+        from ._workerfile import worker_script
+        script_path = worker_script("transparent_worker", _WORKER_SOURCE)
         self._proc = subprocess.Popen(
             [sys.executable, script_path, "metal"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,

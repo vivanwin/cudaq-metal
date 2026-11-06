@@ -32,6 +32,10 @@ venv/
 *.tmp
 *.ll.tmp
 
-# NOTE: packaging/src/cudaq_metal/data/libnvqir-metal.dylib IS committed on
-# purpose — it is the shipped, prebuilt backend. Refresh it with
-# packaging/refresh_binary.sh after changing the C++ sources.
+# NOTE: cudaq_metal/data/libnvqir-metal.dylib IS committed on purpose — it is
+# the shipped, prebuilt backend. Refresh it with scripts/refresh_binary.sh
+# after changing the C++ sources or moving to a new CUDA-Q version.
+
+# Worker scripts generated at runtime by older versions (now in a temp cache)
+cudaq_metal/_worker.py
+cudaq_metal/_worker_transparent.py
