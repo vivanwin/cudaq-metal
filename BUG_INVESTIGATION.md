@@ -134,8 +134,8 @@ communicate the result back.
 The reproducer (a 15-node warm-start QAOA built with Classiq and evaluated
 with `cudaq.observe` on the metal target; failures are non-deterministic, so
 run it several times) was `benchmark/repro_realqaoa.py`. It was removed after
-the fix shipped in CUDA-Q 0.16 and is available in the git history at tag
-`v0.2.0`.
+the fix shipped in CUDA-Q 0.16 and is available in the git history (commit
+`007fc09`).
 
 ## Upstream ask (no longer needed — fixed in CUDA-Q 0.16)
 
