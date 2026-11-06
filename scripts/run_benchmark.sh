@@ -1,6 +1,10 @@
 #!/bin/bash
 # Compile the CUDA-Q GHZ benchmark for both qpp-cpu and metal, then run both.
 # Usage: run_benchmark.sh [minQ] [maxQ] [shots] [repeats]
+#
+# NOTE: this C++ (nvq++) path needs the official CUDA-Q C++ toolkit, with the
+# backend built against it (cmake -DNVQIR_DIR=$CQ/lib/cmake/nvqir) and the
+# toolkit version matching the plugin. The Python benchmarks don't need this.
 set -euo pipefail
 
 CQ="${CUDAQ_INSTALL:-$HOME/.cudaq-metal/cudaq}"

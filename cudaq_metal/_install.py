@@ -8,6 +8,7 @@ config (``<site-packages>/targets/metal.yml``), which is exactly where
 """
 from __future__ import annotations
 
+import filecmp
 import importlib.util
 import os
 import platform
@@ -19,8 +20,9 @@ try:
 except ImportError:  # pragma: no cover
     _files = None
 
-# CUDA-Q version(s) this prebuilt binary is ABI-compatible with.
-COMPATIBLE_CUDAQ = ("0.15.0", "0.15.1")
+# CUDA-Q version(s) this prebuilt binary is ABI-compatible with (prefix match on
+# the version of the binary distribution, e.g. cuda-quantum-cu13 0.16.0).
+COMPATIBLE_CUDAQ = ("0.16.",)
 
 
 def _data_dir() -> str:
@@ -33,7 +35,7 @@ def _cudaq_plugin_dirs() -> tuple[str, str]:
     if spec is None or not spec.origin:
         raise RuntimeError(
             "cudaq is not installed in this environment. "
-            "Install it first, e.g. `pip install cudaq==0.15.0`."
+            "Install it first, e.g. `pip install cudaq==0.16.0`."
         )
     # cudaq/__init__.py -> <site-packages>/cudaq -> <site-packages>
     site = os.path.dirname(os.path.dirname(spec.origin))
@@ -61,7 +63,9 @@ def _warn_if_version_mismatch() -> None:
         from importlib.metadata import PackageNotFoundError, version
 
         ver = ""
-        for dist in ("cudaq", "cuda-quantum"):
+        # The actual binary on macOS is cuda-quantum-cu13; `cudaq` is a
+        # meta-package whose version can carry extra suffixes (.post1).
+        for dist in ("cuda-quantum-cu13", "cudaq", "cuda-quantum"):
             try:
                 ver = version(dist)
                 break
@@ -95,7 +99,9 @@ def install(force: bool = False, quiet: bool = True) -> tuple[str, str]:
     dst_yml = os.path.join(targets_dir, "metal.yml")
 
     for src, dst in ((src_dylib, dst_dylib), (src_yml, dst_yml)):
-        if force or not os.path.exists(dst) or os.path.getsize(src) != os.path.getsize(dst):
+        # Compare contents, not just size: an upgraded binary can have the
+        # same size as the old one. Both files are small, so this is cheap.
+        if force or not os.path.exists(dst) or not filecmp.cmp(src, dst, shallow=False):
             shutil.copyfile(src, dst)
             if src.endswith(".dylib"):
                 os.chmod(dst, 0o755)

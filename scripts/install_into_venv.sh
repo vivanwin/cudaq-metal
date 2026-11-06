@@ -1,9 +1,22 @@
 #!/bin/bash
-# Copy the freshly built Metal backend into the Python cudaq (venv) so that
-# `cudaq.set_target("metal")` picks it up. Run scripts/build_backend.sh first.
+# Dev helper: copy a freshly built backend straight into a Python env's cudaq so
+# `cudaq.set_target("metal")` picks it up, without reinstalling the package.
+# Run scripts/build_backend.sh first.
+#
+# Usage: scripts/install_into_venv.sh [PYTHON]   (default: python3)
 set -euo pipefail
-CQ="${CUDAQ_INSTALL:-$HOME/.cudaq-metal/cudaq}"
-SP="$HOME/.cudaq-metal/venv/lib/python3.12/site-packages"
-cp "$CQ/lib/libnvqir-metal.dylib" "$SP/lib/"
-cp "$CQ/targets/metal.yml" "$SP/targets/"
-echo "installed metal backend into venv: $SP/{lib,targets}"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PY="${1:-${PYTHON:-python3}}"
+{ read -r VER; read -r LIB; } < <("$PY" - <<'EOF'
+import importlib.metadata as md, importlib.util, os, re
+spec = importlib.util.find_spec("cudaq")
+print(re.match(r"\d+\.\d+\.\d+", md.version("cuda-quantum-cu13")).group(0))
+print(os.path.join(os.path.dirname(os.path.dirname(spec.origin)), "lib"))
+EOF
+)
+TARGETS="$(dirname "$LIB")/targets"
+mkdir -p "$TARGETS"
+cp "$ROOT/build/cudaq-$VER/libnvqir-metal.dylib" "$LIB/"
+cp "$ROOT/targets/metal.yml" "$TARGETS/"
+echo "installed metal backend (cudaq $VER) into $LIB and $TARGETS"
