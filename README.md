@@ -65,6 +65,56 @@ Import `cudaq_metal` **before** `cudaq`: cudaq reads its list of targets once,
 at import. If cudaq was imported first, the very first install warns you and
 `set_target("metal")` works after a Python restart.
 
+### How `observe` works
+
+Without shots, `cudaq.observe(kernel, H)` hands the whole Hamiltonian to the
+backend, as CUDA-Q's `nvidia` target does (`canHandleObserve`). One batched
+pass evaluates every Pauli term: no basis-change gates and no separate pass
+over the state per term. Large states run it on the GPU (`pauli_expect`:
+fp32 partial sums over at most 64 amplitudes per thread, final reduction in
+double); small ones run it on the host, on all cores in double, where a GPU
+round trip would cost more than the work. Results look exactly as before:
+`result.expectation()` and per-term `result.expectation(term)`.
+
+- With `shots_count=...`, CUDA-Q's term-by-term sampling runs instead (it
+  needs real samples per term).
+- `CUDAQ_OBSERVE_FROM_SAMPLING=1`, CUDA-Q's own switch, turns the batched path
+  off for shot-free observe as well.
+- `MSV_OBSERVE_DEVICE=gpu` or `host` forces where the batched pass runs
+  (default: by state size × term count).
+
+How much it buys depends on the Hamiltonian. For a ZZ-only cost Hamiltonian
+(Max-Cut QAOA, 20–40 terms) `observe` is 1.15–2× faster at 16–24 qubits.
+Terms with X or Y used to cost two GPU round trips of basis-change gates
+each, so mixed Pauli Hamiltonians gain most: 2.6–12× with 8 terms, 30–150×
+with 64–2,000 terms (2,000 terms on 12 qubits: 600 ms → 5 ms). GPU and host agree to within 3e-9 up to 30 qubits; `tests/test_observe.py`
+checks both against an independent numpy reference and `qpp-cpu`.
+
+### Repeated calls
+
+CUDA-Q builds and frees the statevector on every `sample`, `observe` and
+`get_state`, which an optimizer loop does hundreds of times. Two things keep
+that per-call cost low:
+
+- **Lazy qubit allocation.** A constant-size register (`cudaq.qvector(20)`,
+  or the builder's `qalloc(20)`, which is what every Classiq kernel uses)
+  reaches the backend one qubit at a time. The statevector is built once, at
+  full size, when the first gate runs, instead of being regrown per qubit.
+- **Buffer reuse.** The two most recently freed statevector buffers (17
+  qubits and up) are kept, each for the next state of exactly its size, so a
+  loop that alternates two sizes also skips allocating and GPU-mapping fresh
+  memory; the expectation-value scratch is kept the same way. Idle buffers
+  are marked purgeable, so macOS can reclaim them under memory pressure, and
+  they are released before a new allocation would exceed the GPU's
+  recommended working set, or if one fails. Otherwise they stay in your
+  process's memory (8 GiB after a 30-qubit run).
+  `MSV_DISABLE_BUFFER_CACHE=1` frees every buffer after each call instead
+  (`0`, `false`, `no` and `off` leave reuse on).
+
+Together they cut the fixed cost of a call from 27 to 2.8 ms at 24 qubits
+and from 431 to 35 ms at 28 (an almost empty builder kernel). On the
+benchmark below that is 5–29% from 17 qubits up (n=30: 15.9 → 14.1 s).
+
 ## Examples
 
 Two ready-to-run scaling examples in [`examples/`](examples/):
@@ -79,31 +129,42 @@ Two ready-to-run scaling examples in [`examples/`](examples/):
 Both are ~30 lines including imports; scale up by changing the `N` and
 `DEPTH` constants at the top.
 
+And one full demo:
+
+- [`qaoa_maxcut/qaoa_maxcut.ipynb`](examples/qaoa_maxcut/qaoa_maxcut.ipynb) —
+  QAOA Max-Cut on a random 4-regular graph, modelled at a high level in Classiq
+  (`phase` of the cut expression inside `repeat`, no hand-written gates) and
+  optimized three ways with the same COBYLA loop: Classiq's cloud `minimize`,
+  CUDA-Q's `qpp-cpu`, and `metal` (or `nvidia` on an NVIDIA GPU) through the
+  batched `observe`. A scaling sweep from 8 qubits up grows each backend until
+  one run takes over a minute; the saved results compare an M5 Pro with an
+  NVIDIA T4 on Google Colab. Needs Classiq 1.35 or newer.
+
 ## Performance
 
 The benchmark runs the `brickwork_classiq.py` circuit — synthesized by
 Classiq and converted with `qprog_to_cudaq_kernel` — on CUDA-Q's CPU
 simulator (`qpp-cpu`) and on `metal`, timing one
 `cudaq.observe(kernel, Σ Zᵢ)` per point; synthesis and kernel construction
-happen before the clock starts. Apple M5 Pro (24 GB), CUDA-Q 0.16.0, mean of
-3 runs:
+happen before the clock starts. Apple M5 Pro (24 GB), CUDA-Q 0.16.0, median
+of at least 5 runs (fast points repeat until they add up to 0.5 s):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="benchmarks/results/examples-dark.png">
-  <img alt="Time per cudaq.observe() vs qubit count for a Classiq circuit: qpp-cpu doubles per qubit to about 2 s at 17 qubits; metal stays near 1–2 ms up to 17 qubits, about 1,000 times faster there, and reaches 30 qubits in about 18 s." src="benchmarks/results/examples.png">
+  <img alt="Time per cudaq.observe() vs qubit count for a Classiq circuit: qpp-cpu doubles per qubit to about 2 s at 17 qubits; metal stays near 0.5–1.0 ms up to 17 qubits, about 1,960 times faster there, and reaches 30 qubits in about 14 s." src="benchmarks/results/examples.png">
 </picture>
 
 - **qpp-cpu** doubles per qubit, as a CPU statevector does: ~2 s per observe
   at n=17.
-- **metal** stays at ~1–2 ms up to n=17, where the fixed GPU dispatch cost
-  dominates, and ~10 ms at n=20. From there it doubles per qubit as memory
-  bandwidth takes over: ~0.5 s at n=25 (256 MB statevector).
-- **At n=17, metal is ~1,000× faster** (2.07 s → 2.1 ms). Metal's
-  few-millisecond times vary between runs at these sizes; an earlier run
-  measured 550–900×.
-- Metal reaches **n=30** (an 8 GiB statevector) in ~18 s per observe;
+- **metal** stays at ~0.5–1.0 ms up to n=17, where the fixed per-call cost
+  dominates, and ~6 ms at n=20. From there it doubles per qubit as memory
+  bandwidth takes over: ~0.37 s at n=25 (256 MB statevector).
+- **At n=17, metal is ~1,960× faster** (2.03 s → 1.04 ms). Metal's
+  millisecond-scale times are sensitive to run-to-run noise; earlier runs of
+  this benchmark measured 550–1,900×.
+- Metal reaches **n=30** (an 8 GiB statevector) in ~14 s per observe;
   extrapolating qpp-cpu's doubling puts it at several hours.
-- At 8 qubits there is nothing to win: both take about 1 ms.
+- At 8 qubits there is little to win: ~1.2 ms vs ~0.5 ms.
 
 The frontend doesn't change these numbers: the same gates written as a
 native `@cudaq.kernel` (`brickwork_native.py`) simulate at the same speed.
@@ -120,11 +181,11 @@ python benchmarks/plot_examples.py
 
 | Path | Purpose |
 |------|---------|
-| `src/metal_sv.{h,mm}` | Metal statevector engine (C-ABI, Objective-C++). One unified-memory MTLBuffer, fast `apply1q` and `apply2q` kernels + general `applykq` up to 4 targets, lazy command-buffer batching, pipelines compiled once per process. |
-| `src/MetalCircuitSimulator.cpp` | The NVQIR backend: `CircuitSimulatorBase<float>` subclass. Gate fusion, multi-core sampling / expectation values / measurement over the unified-memory state, zero-copy `get_state`, state initialization, and a tripwire that warns loudly if cudaq ever silently drops a kernel's gates again (the old Darwin arm64 bug). |
+| `src/metal_sv.{h,mm}` | Metal statevector engine (C-ABI, Objective-C++). One unified-memory MTLBuffer, fast `apply1q` and `apply2q` kernels + general `applykq` up to 4 targets, a `pauli_expect` kernel that evaluates batches of Pauli terms in one pass, lazy command-buffer batching, pipelines compiled once per process, statevector buffer reuse across calls. |
+| `src/MetalCircuitSimulator.cpp` | The NVQIR backend: `CircuitSimulatorBase<float>` subclass. Lazy qubit allocation, gate fusion, batched whole-Hamiltonian `observe` (GPU or host), multi-core sampling / measurement over the unified-memory state, zero-copy `get_state`, state initialization, and a tripwire that warns loudly if cudaq ever silently drops a kernel's gates again (the old Darwin arm64 bug). |
 | `scripts/` | Build tooling: `fetch_cudaq_headers.py` (pulls the ~0.7 MB of CUDA-Q headers the plugin needs from the matching source tag), `build_backend.sh`, `refresh_binary.sh` (rebuild + bundle + wheel). |
 | `cudaq_metal/` | Python package. Bundles the prebuilt plugin and its CUDA-Q target config (`data/metal.yml`, fp32) and installs both into the active cudaq on import (also available as `cudaq-metal-install`). |
-| `tests/` | pytest suite checking `metal` against `qpp-cpu`: every kernel, fusion on/off, sampling, observe, measurement, reset, state init, errors. |
+| `tests/` | pytest suite checking `metal` against `qpp-cpu`: every kernel, fusion on/off, sampling, observe, measurement, reset, state init, lazy allocation, buffer reuse on/off, errors. `test_observe.py` checks the batched observe on both GPU and host against an independent numpy reference and qpp-cpu (all Pauli phases, per-term results, shots, chunking, determinism). |
 | `benchmarks/` | Scaling benchmark + measured CSV + plot generator, and a fusion A/B benchmark. |
 | `examples/` | Small end-to-end examples. |
 | `BUG_INVESTIGATION.md` | Root-cause deep-dive on the (now fixed) CUDA-Q Darwin arm64 bug and every workaround we tried. |
@@ -173,7 +234,7 @@ Empirically on an **Apple M5 Pro (24 GB unified)**:
 
 - `maxBufferLength` = **14.30 GB** (13.32 GiB)
 - `recommendedMaxWorkingSetSize` = 19.07 GB (advisory)
-- **n=30 → 8.6 GB buffer → OK** (~18 s per observe, verified on-machine)
+- **n=30 → 8.6 GB buffer → OK** (~14 s per observe, verified on-machine)
 - **n=31 → 17.2 GB buffer → fails** with
   `a 31-qubit statevector needs 16.00 GiB, but this GPU's maxBufferLength is 13.32 GiB`
 
@@ -187,10 +248,10 @@ the benchmark above):
 
 | n | statevector | observe |
 |---|---|---|
-| 25 | 256 MB | 0.49 s |
-| 27 | 1 GB | 2.0 s |
-| 29 | 4 GB | 8.7 s |
-| 30 | 8 GB | 18.5 s |
+| 25 | 256 MB | 0.37 s |
+| 27 | 1 GB | 1.6 s |
+| 29 | 4 GB | 6.9 s |
+| 30 | 8 GB | 14.1 s |
 
 ## Limitations, honestly
 
@@ -200,6 +261,10 @@ the benchmark above):
   an error (rare in practice — Classiq's synthesizer produces 1- and 2-qubit
   gates for QAOA/VQE).
 - **No noise models** — this is an ideal statevector simulator.
+- **Upstream: the list form of observe.** In CUDA-Q 0.16,
+  `cudaq.observe(kernel, [H1, H2, ...])` drops term coefficients from each
+  total on every backend, `qpp-cpu` included; per-term values are correct.
+  Observe each Hamiltonian separately until that is fixed upstream.
 - **One CUDA-Q minor version per release.** The plugin is compiled against
   CUDA-Q's C++ internals, so each CUDA-Q minor release needs a rebuild (see
   [Building from source](#building-from-source)).

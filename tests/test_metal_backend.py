@@ -7,8 +7,9 @@ Run on an Apple Silicon Mac with cudaq installed:
 
 Covers every engine kernel (apply1q, apply2q, applykq with k=3/4, controlled
 multi-target gates), gate fusion on and off, sampling, observe, mid-circuit
-measurement, reset, state initialization, the multi-chunk host paths (n >= 17)
-and error reporting.
+measurement, reset, state initialization, the multi-chunk host paths (n >= 17),
+lazy qubit allocation, buffer reuse (on and off, checked with the plugin's
+own counters) and error reporting.
 """
 import os
 import subprocess
@@ -20,6 +21,8 @@ import pytest
 import cudaq_metal  # noqa: F401  (registers the target; must precede cudaq)
 import cudaq
 from cudaq import spin
+
+from _util import buffer_stats, env_flag, on
 
 _rng = np.random.default_rng(1234)
 
@@ -145,6 +148,17 @@ def append_state(st: cudaq.State):
 
 
 @cudaq.kernel
+def append_after_flush(st: cudaq.State):
+    # exp_pauli flushes, so the engine exists (2 qubits) when the state block
+    # is appended: the grow-then-tensor path, not the lazy one.
+    a = cudaq.qvector(2)
+    h(a[0])
+    exp_pauli(0.3, a, "ZZ")
+    b = cudaq.qvector(st)
+    x.ctrl(a[0], b[0])
+
+
+@cudaq.kernel
 def from_list(v: list[complex]):
     q = cudaq.qvector(v)
     h(q[0])
@@ -159,18 +173,50 @@ def five_target_gate():
 
 @cudaq.kernel
 def register_of(n: int):
-    # n is a runtime argument on purpose: a constant-size qvector is allocated
-    # one qubit at a time, which would grow a real ~8 GB state before failing.
     q = cudaq.qvector(n)
     mz(q)
 
 
-def on(target, fn, *args, **kwargs):
-    cudaq.set_target(target)
-    try:
-        return fn(*args, **kwargs)
-    finally:
-        cudaq.reset_target()
+@cudaq.kernel
+def literal_register():
+    # A constant-size register reaches the backend one qubit at a time; the
+    # engine is built lazily, once, at 18 qubits.
+    q = cudaq.qvector(18)
+    for i in range(18):
+        ry(0.1 + 0.05 * i, q[i])
+    for i in range(17):
+        x.ctrl(q[i], q[i + 1])
+
+
+@cudaq.kernel
+def grow_after_flush():
+    # exp_pauli flushes the gate queue, so the engine is built at 2 qubits
+    # before the ancilla arrives and has to grow afterwards.
+    q = cudaq.qvector(2)
+    h(q[0])
+    ry(0.4, q[1])
+    exp_pauli(0.3, q, "ZZ")
+    a = cudaq.qubit()
+    x.ctrl(q[0], a)
+    ry(0.2, a)
+
+
+@cudaq.kernel
+def no_gates(n: int):
+    q = cudaq.qvector(n)
+
+
+def builder_brickwork(n):
+    """Builder kernel (what Classiq's qprog_to_cudaq_kernel returns)."""
+    k = cudaq.make_kernel()
+    q = k.qalloc(n)
+    for i in range(n):
+        k.ry(0.3 + 0.02 * i, q[i])
+    for j in range(0, n - 1, 2):
+        k.cx(q[j], q[j + 1])
+        k.rz(0.7, q[j + 1])
+        k.cx(q[j], q[j + 1])
+    return k
 
 
 def state(target, kernel, *args):
@@ -202,7 +248,7 @@ def test_state_matches_qpp(case):
     assert_same_state(state("qpp-cpu", kernel, *args), state("metal", kernel, *args))
 
 
-@pytest.mark.skipif(bool(os.environ.get("MSV_DISABLE_FUSION")), reason="this is the fusion-off run")
+@pytest.mark.skipif(env_flag("MSV_DISABLE_FUSION"), reason="this is the fusion-off run")
 def test_state_matches_qpp_with_fusion_disabled():
     # MSV_DISABLE_FUSION is read when the simulator is created, so it needs a
     # fresh process.
@@ -258,7 +304,7 @@ def test_mid_circuit_measurement_and_conditional():
 
 def test_initialize_from_state():
     v = np.array([0.6, 0.8j, 0.0, 0.0], dtype=np.complex64)
-    for kernel in (from_state, append_state):
+    for kernel in (from_state, append_state, append_after_flush):
         expected = state("qpp-cpu", kernel, cudaq.State.from_data(v.astype(np.complex128)))
         cudaq.set_target("metal")
         try:
@@ -289,3 +335,110 @@ def test_too_many_qubits_raises():
         on("metal", cudaq.sample, register_of, 32)
     # The simulator must still work afterwards.
     assert set(on("metal", cudaq.sample, ghz_measured, 3, shots_count=100)) <= {"000", "111"}
+
+
+def test_too_many_qubits_raises_without_gates():
+    # The engine is built lazily, but an impossible size is still reported at
+    # the allocation, even if nothing ever touches the state.
+    with pytest.raises(RuntimeError, match="outside the supported range"):
+        on("metal", cudaq.observe, no_gates, spin.z(0), 32)
+
+
+# ---- lazy qubit allocation and statevector buffer reuse ---------------------
+# MSV_DISABLE_BUFFER_CACHE is read on every allocation and free, so the
+# buffer_cache fixture toggles it in-process.
+
+def _set_buffer_cache(monkeypatch, mode):
+    """mode "on" (unset), "off" (=1) or "zero" (=0, which must keep it on);
+    returns whether reuse is on."""
+    value = {"on": None, "off": "1", "zero": "0"}[mode]
+    if value is None:
+        monkeypatch.delenv("MSV_DISABLE_BUFFER_CACHE", raising=False)
+    else:
+        monkeypatch.setenv("MSV_DISABLE_BUFFER_CACHE", value)
+    return mode != "off"
+
+
+@pytest.fixture(params=["on", "off"])
+def buffer_cache(request, monkeypatch):
+    """Run with buffer reuse on and off; the value is whether it is on."""
+    return _set_buffer_cache(monkeypatch, request.param)
+
+
+@pytest.mark.parametrize("case", ["literal_register", "grow_after_flush", "builder"])
+def test_lazy_allocation_matches_qpp(case, buffer_cache):
+    kernel, args = {"literal_register": (literal_register, ()),
+                    "grow_after_flush": (grow_after_flush, ()),
+                    "builder": (builder_brickwork(18), ())}[case]
+    assert_same_state(state("qpp-cpu", kernel, *args), state("metal", kernel, *args))
+
+
+def test_gate_free_kernel():
+    expected = np.zeros(2**18, dtype=np.complex128)
+    expected[0] = 1.0
+    assert_same_state(expected, state("metal", no_gates, 18))
+    H = spin.z(0) + 2.0 * spin.z(17) + 0.5 * spin.x(3)
+    assert on("metal", cudaq.observe, no_gates, H, 18).expectation() == pytest.approx(3.0)
+
+
+def test_reused_buffer_starts_clean(buffer_cache):
+    # Same-size states back to back reuse one buffer (18 qubits is above the
+    # cache threshold): every run must start from |0...0>, whatever the
+    # previous one left behind, through each way a state ends (observe,
+    # sample, an extracted state that is then dropped).
+    n = 18
+    H = spin.z(0) * spin.z(n - 1) + 0.5 * spin.x(1) * spin.x(2)
+    want_hw = state("qpp-cpu", hw_efficient, n, 2)
+    want_obs = on("qpp-cpu", cudaq.observe, hw_efficient, H, n, 2).expectation()
+    for _ in range(2):
+        assert_same_state(want_hw, state("metal", hw_efficient, n, 2))
+        assert on("metal", cudaq.observe, hw_efficient, H, n, 2).expectation() == pytest.approx(want_obs, abs=1e-4)
+        counts = on("metal", cudaq.sample, ghz_measured, n, shots_count=200)
+        assert set(counts) <= {"0" * n, "1" * n}
+        assert_same_state(state("qpp-cpu", ghz, n), state("metal", ghz, n))
+    # A different size in between, then the original size again.
+    assert_same_state(state("qpp-cpu", ghz, n + 1), state("metal", ghz, n + 1))
+    assert_same_state(want_hw, state("metal", hw_efficient, n, 2))
+
+
+def test_extracted_state_survives_reuse(buffer_cache):
+    # get_state hands the engine's buffer to the returned state; running more
+    # same-size kernels while it is alive must not touch it.
+    n = 18
+    cudaq.set_target("metal")
+    try:
+        kept = cudaq.get_state(ghz, n)
+        cudaq.get_state(hw_efficient, n, 2)
+        cudaq.observe(hw_efficient, spin.z(0), n, 2)
+        got = np.array(kept, copy=True).astype(np.complex128)
+    finally:
+        cudaq.reset_target()
+    assert_same_state(state("qpp-cpu", ghz, n), got)
+
+
+def _observe_sizes(sizes):
+    """Shot-free observe of an 18+-qubit kernel per size (GPU expectation
+    path, so it uses scratch); returns the change in buffer_stats()."""
+    before = buffer_stats()
+    for n in sizes:
+        on("metal", cudaq.observe, hw_efficient, spin.z(0), n, 1)
+    return tuple(b - a for a, b in zip(before, buffer_stats()))
+
+
+@pytest.mark.parametrize("mode", ["on", "off", "zero"])
+def test_buffers_are_reused(mode, monkeypatch):
+    enabled = _set_buffer_cache(monkeypatch, mode)
+    _observe_sizes([18])  # leaves an idle 18-qubit buffer and scratch
+    allocs, reuses, scratch = _observe_sizes([18] * 3)
+    if enabled:
+        assert (allocs, reuses) == (0, 3) and scratch == 3
+    else:
+        assert (allocs, reuses, scratch) == (3, 0, 0)
+
+
+def test_two_alternating_sizes_both_reuse(buffer_cache):
+    # The pool keeps the two most recent sizes, so a loop that alternates
+    # (a kernel with and without an ancilla, say) never reallocates.
+    _observe_sizes([18, 19])
+    allocs, reuses, _ = _observe_sizes([18, 19] * 2)
+    assert (allocs, reuses) == ((0, 4) if buffer_cache else (4, 0))

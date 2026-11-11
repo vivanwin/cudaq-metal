@@ -27,7 +27,7 @@ def load():
     data, depths = {k: {} for k in SERIES}, set()
     with open(CSV) as f:
         for row in csv.DictReader(f):
-            data[row["target"]][int(row["n"])] = float(row["mean"])
+            data[row["target"]][int(row["n"])] = float(row["median"])
             depths.add(row["depth"])
     return data, "/".join(sorted(depths))
 
@@ -77,7 +77,7 @@ def plot(data, depth, out, t):
     fig.text(0.075, 0.95, "Classiq circuit on Apple GPU vs CPU",
              fontsize=13, fontweight="bold", color=t["ink"])
     fig.text(0.075, 0.905, f"Hardware-efficient ansatz (RY + CX·RZ·CX brickwork, depth {depth}) "
-             r"via qprog_to_cudaq_kernel · observe $\langle \Sigma_i\, Z_i \rangle$ · mean of 3 runs",
+             r"via qprog_to_cudaq_kernel · observe $\langle \Sigma_i\, Z_i \rangle$ · median of ≥5 runs",
              fontsize=9, color=t["ink2"])
     leg = ax.legend(loc="upper left", frameon=False, fontsize=9, handlelength=2.2)
     for txt in leg.get_texts():

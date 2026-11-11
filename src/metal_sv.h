@@ -34,7 +34,16 @@ typedef struct MSVState MSVState; // opaque handle
 // Create a simulator for `nQubits` (1..MSV_MAX_QUBITS), state |0...0>.
 // Returns NULL if there is no Metal device or the statevector does not fit.
 MSVState *msv_create(int nQubits);
+// Destroy a simulator. Its statevector buffer (17+ qubits) is kept, purgeable,
+// for a later msv_create or msv_grow_to of the same size, which then skips
+// allocating and GPU-mapping fresh memory (the two most recently freed sizes
+// are kept); MSV_DISABLE_BUFFER_CACHE=1 frees it instead.
 void msv_destroy(MSVState *s);
+
+// Check, without allocating, that an `nQubits` statevector is supported here
+// (qubit range and the GPU's maxBufferLength). Returns 0, or -1 with the
+// reason in msv_last_error().
+int msv_check_qubits(int nQubits);
 
 // Reset the state back to |0...0> (no reallocation).
 void msv_reset(MSVState *s);
@@ -64,8 +73,31 @@ int msv_grow_to(MSVState *s, int newNQubits);
 // the next gate. Returns NULL if synchronizing failed.
 void *msv_data(MSVState *s);
 
+// Expectation values of Pauli strings, computed on the GPU in one pass over
+// the state per batch of 8 terms. Term t is given by two qubit masks:
+// xmask[t] = qubits carrying X or Y, zmask[t] = qubits carrying Z or Y (so Y
+// sits in both). For each term, writes the UNNORMALIZED value
+//   out[t] = <psi| P_t |psi>
+//          = Re( i^nY * sum_j (-1)^popcount(j & z) * psi[j] * conj(psi[j ^ x]) )
+// with nY = popcount(x & z). A term with both masks 0 yields <psi|psi>.
+// Per-thread and per-simdgroup sums are fp32; the final reduction is double.
+// Returns 0, or -1 for masks outside the state or a GPU failure.
+int msv_pauli_expectations(MSVState *s, const unsigned *xmask,
+                           const unsigned *zmask, size_t nTerms, double *out);
+
 // Number of qubits the simulator currently holds.
 int msv_num_qubits(const MSVState *s);
+
+// 1 if environment variable `name` is set to anything but "", "0", "false",
+// "no" or "off" (case-insensitive), else 0. Used for the MSV_DISABLE_* knobs.
+int msv_env_flag(const char *name);
+
+// Process-wide counters (for tests and benchmarks): fresh statevector
+// allocations, statevectors served from the reuse pool, and expectation-value
+// scratch buffers served from it. Any pointer may be NULL.
+void msv_buffer_stats(unsigned long long *stateAllocations,
+                      unsigned long long *stateReuses,
+                      unsigned long long *scratchReuses);
 
 // Reason for the most recent failure on this thread ("" if none).
 const char *msv_last_error(void);

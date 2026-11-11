@@ -4,7 +4,7 @@
 // memory, no host<->device copies). Amplitude index is little-endian in the
 // qubit label: qubit q occupies bit q of the index.
 //
-// Three compute kernels:
+// Four compute kernels:
 //   apply1q  — 2x2 matrix on one target qubit, gated by a control mask. Each
 //              thread owns one disjoint amplitude pair. Fast path for the
 //              common single-target gates (H/X/Z/rotations, CX/CCX/CZ).
@@ -13,6 +13,9 @@
 //   applykq  — general 2^k x 2^k matrix on k <= MSV_MAX_TARGETS targets. Each
 //              thread owns one disjoint group of 2^k amplitudes, gathers them,
 //              does the matrix-vector product, and scatters back.
+//   pauli_expect — read-only: <psi|P|psi> for a batch of 8 Pauli strings per
+//              grid row, reduced per simdgroup on the GPU and summed in
+//              double on the host (see msv_pauli_expectations).
 //
 // Execution is lazy: dispatches accumulate in one open command buffer using a
 // *serial* compute encoder (Metal orders serial-encoder dispatches with
@@ -21,14 +24,22 @@
 // is what otherwise sinks the GPU on shallow circuits.
 //
 // The device, queue and compiled pipelines are process-wide (built once on
-// first use); each MSVState owns only its statevector buffer.
+// first use); each MSVState owns only its statevector buffer. Freed buffers
+// are kept for reuse (see BufferPool), because a fresh multi-GiB buffer costs
+// more than most circuits.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <dispatch/dispatch.h>
+#include <strings.h>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "metal_sv.h"
 
@@ -64,6 +75,16 @@ struct GateKQ {
 static_assert(sizeof(GateKQ) == 32, "GateKQ layout must match MSL");
 // applykq below hard-codes `targets[4]` and `in[16]` (= 2^MSV_MAX_TARGETS).
 static_assert(MSV_MAX_TARGETS == 4, "update applykq's arrays in kMetalSource");
+
+struct PauliParams {
+  unsigned dim;        // 2^n
+  unsigned perThread;  // amplitudes each thread sums
+  unsigned slots;      // simdgroups in the x extent = partial sums per term
+  unsigned firstBatch; // first 8-term batch of this dispatch
+};
+static_assert(sizeof(PauliParams) == 16, "PauliParams layout must match MSL");
+// pauli_expect hard-codes 8 accumulators per thread.
+constexpr size_t kPauliBatch = 8;
 // 32-bit amplitude indices in every kernel.
 static_assert(MSV_MAX_QUBITS <= 31, "kernels index amplitudes with uint");
 
@@ -168,6 +189,60 @@ kernel void applykq(device float2*        psi [[buffer(0)]],
         psi[idx] = acc;
     }
 }
+
+struct PauliParams {
+    uint dim;
+    uint perThread;
+    uint slots;
+    uint firstBatch;
+};
+
+// Pauli-string expectation values (see msv_pauli_expectations). Grid x covers
+// the state, grid y is the 8-term batch. Each simdgroup owns a contiguous
+// block of W*perThread amplitudes, lane-interleaved so loads coalesce; each
+// thread keeps one fp32 accumulator per term, simd_sum combines the lanes and
+// lane 0 writes one partial per (batch, simdgroup, term) for the host to sum
+// in double. terms[t] = (x mask, z mask, 1 = take the imaginary part, 0);
+// the host applies the remaining sign of i^nY.
+kernel void pauli_expect(device const float2*  psi      [[buffer(0)]],
+                         device const uint4*   terms    [[buffer(1)]],
+                         device float*         partial  [[buffer(2)]],
+                         constant PauliParams& p        [[buffer(3)]],
+                         uint2 tg       [[threadgroup_position_in_grid]],
+                         uint  sgInTg   [[simdgroup_index_in_threadgroup]],
+                         uint  sgPerTg  [[simdgroups_per_threadgroup]],
+                         uint  lane     [[thread_index_in_simdgroup]],
+                         uint  W        [[threads_per_simdgroup]]) {
+    const uint sg = tg.x * sgPerTg + sgInTg;
+    uint tx[8], tz[8];
+    bool tim[8];
+    float acc[8];
+    for (uint t = 0u; t < 8u; ++t) {
+        const uint4 term = terms[(p.firstBatch + tg.y) * 8u + t];
+        tx[t] = term.x;
+        tz[t] = term.y;
+        tim[t] = term.z != 0u;
+        acc[t] = 0.0f;
+    }
+    const uint base = sg * W * p.perThread + lane;
+    for (uint j = 0u; j < p.perThread; ++j) {
+        const uint idx = base + j * W;
+        if (idx >= p.dim) break;
+        const float2 a = psi[idx];
+        for (uint t = 0u; t < 8u; ++t) {
+            // a * conj(b): real part a.b, imaginary part a.y*b.x - a.x*b.y.
+            const float2 b = tx[t] != 0u ? psi[idx ^ tx[t]] : a;
+            const float v = tim[t] ? (a.y * b.x - a.x * b.y)
+                                   : (a.x * b.x + a.y * b.y);
+            acc[t] += (popcount(idx & tz[t]) & 1u) ? -v : v;
+        }
+    }
+    for (uint t = 0u; t < 8u; ++t) {
+        const float s = simd_sum(acc[t]);
+        if (lane == 0u) // sg < p.slots always: slots = every simdgroup
+            partial[(tg.y * p.slots + sg) * 8u + t] = s;
+    }
+}
 )MSL";
 
 thread_local std::string gLastError;
@@ -186,7 +261,8 @@ void setError(const char *fmt, ...) {
 struct MetalContext {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
-  id<MTLComputePipelineState> pso1q = nil, pso2q = nil, psoKq = nil;
+  id<MTLComputePipelineState> pso1q = nil, pso2q = nil, psoKq = nil,
+                              psoPauli = nil;
   std::string error; // non-empty if initialization failed
 };
 
@@ -224,6 +300,7 @@ const MetalContext &context() {
       c->pso1q = makePso(@"apply1q");
       c->pso2q = makePso(@"apply2q");
       c->psoKq = makePso(@"applykq");
+      c->psoPauli = makePso(@"pauli_expect");
       if (!c->queue && c->error.empty())
         c->error = "could not create a Metal command queue";
     }
@@ -234,12 +311,136 @@ const MetalContext &context() {
 
 double gib(size_t bytes) { return double(bytes) / double(1ull << 30); }
 
-// Allocate a zero-filled 2^n statevector, or nil with gLastError set.
-id<MTLBuffer> allocState(const MetalContext &ctx, int n) {
+// ---- Buffer reuse --------------------------------------------------------------
+// Every CUDA-Q execution allocates the state, runs, and frees it. For a fresh
+// buffer the OS must fault in and zero every page and the GPU must map it on
+// first use, which costs far more than the zeroing itself: ~230 ms for 28
+// qubits, against ~25 ms to reset and use a buffer that is already mapped. So
+// freed buffers go to small process-wide pools and are handed out again:
+//   * statevectors of 17+ qubits: the two most recently freed, each reused
+//     only for a state of exactly its size (two, so that a loop alternating
+//     two sizes, e.g. a kernel with and without an ancilla, still hits);
+//   * expectation-value scratch: the most recently freed, reused for any
+//     request it covers.
+// While idle a buffer is marked purgeable (volatile): under memory pressure
+// macOS may reclaim it instead of swapping, and a reclaimed buffer is simply
+// not reused. Before a fresh statevector is allocated, idle ones are released
+// (oldest first) until idle + new fits in the GPU's recommended working set;
+// if the allocation fails anyway, every idle buffer is released and it is
+// retried once. MSV_DISABLE_BUFFER_CACHE=1 frees every buffer immediately.
+constexpr size_t kMinCachedBytes = size_t(1) << 20; // a 17-qubit statevector
+constexpr size_t kMaxIdleStates = 2;
+
+bool bufferCacheEnabled() {
+  return !msv_env_flag("MSV_DISABLE_BUFFER_CACHE");
+}
+
+// Idle MTLBuffers kept for reuse; thread-safe. Buffers released by a call are
+// released outside the lock.
+class BufferPool {
+public:
+  BufferPool(size_t maxIdle, bool exactSize)
+      : maxIdle_(maxIdle), exactSize_(exactSize) {}
+
+  // The most recent idle buffer exactly `bytes` long (exact-size pool) or at
+  // least that long, or nil.
+  id<MTLBuffer> take(size_t bytes) {
+    id<MTLBuffer> buf = nil;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (size_t i = idle_.size(); i-- > 0;) {
+        const size_t len = idle_[i].length;
+        if (exactSize_ ? len == bytes : len >= bytes) {
+          buf = idle_[i];
+          idle_.erase(idle_.begin() + i);
+          break;
+        }
+      }
+    }
+    // Setting NonVolatile returns the previous state; Empty means the OS
+    // reclaimed the memory while the buffer sat idle (released here).
+    if (buf && [buf setPurgeableState:MTLPurgeableStateNonVolatile] ==
+                   MTLPurgeableStateEmpty)
+      return nil;
+    if (buf)
+      ++hits_;
+    return buf;
+  }
+
+  // Keep `buf` (idle: nothing uses it and its GPU work has finished) as the
+  // most recent entry, releasing the oldest beyond the pool's size.
+  void give(id<MTLBuffer> buf) {
+    [buf setPurgeableState:MTLPurgeableStateVolatile];
+    std::vector<id<MTLBuffer>> released;
+    std::lock_guard<std::mutex> lock(mutex_);
+    idle_.push_back(buf);
+    while (idle_.size() > maxIdle_) {
+      released.push_back(idle_.front());
+      idle_.erase(idle_.begin());
+    }
+    // (`lock` is destroyed before `released`: declared after it.)
+  }
+
+  // Release idle buffers, oldest first, until at most `keepBytes` remain.
+  void trim(size_t keepBytes) {
+    std::vector<id<MTLBuffer>> released;
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t total = 0;
+    for (id<MTLBuffer> b : idle_)
+      total += b.length;
+    while (!idle_.empty() && total > keepBytes) {
+      total -= idle_.front().length;
+      released.push_back(idle_.front());
+      idle_.erase(idle_.begin());
+    }
+  }
+
+  void clear() { trim(0); }
+  unsigned long long hits() const { return hits_; }
+
+private:
+  const size_t maxIdle_;
+  const bool exactSize_;
+  std::mutex mutex_;
+  std::vector<id<MTLBuffer>> idle_; // oldest first
+  std::atomic<unsigned long long> hits_{0};
+};
+
+// Leaked, like the context: no teardown ordering issues at process exit.
+BufferPool &statePool() {
+  static BufferPool *pool = new BufferPool(kMaxIdleStates, /*exactSize=*/true);
+  return *pool;
+}
+BufferPool &scratchPool() {
+  static BufferPool *pool = new BufferPool(1, /*exactSize=*/false);
+  return *pool;
+}
+std::atomic<unsigned long long> gStateAllocations{0};
+
+void releaseIdleBuffers() {
+  statePool().clear();
+  scratchPool().clear();
+}
+
+// A fresh shared buffer, retried once after releasing every idle buffer: the
+// memory they hold may be exactly what is missing.
+id<MTLBuffer> newSharedBuffer(const MetalContext &ctx, size_t bytes) {
+  id<MTLBuffer> buf = [ctx.device newBufferWithLength:bytes
+                                              options:MTLResourceStorageModeShared];
+  if (!buf) {
+    releaseIdleBuffers();
+    buf = [ctx.device newBufferWithLength:bytes
+                                  options:MTLResourceStorageModeShared];
+  }
+  return buf;
+}
+
+// Whether a 2^n statevector is allowed on this device; sets gLastError if not.
+bool checkQubits(const MetalContext &ctx, int n) {
   if (n < 1 || n > MSV_MAX_QUBITS) {
     setError("%d qubits is outside the supported range 1..%d", n,
              MSV_MAX_QUBITS);
-    return nil;
+    return false;
   }
   const size_t bytes = sizeof(C2) << n;
   const size_t limit = ctx.device.maxBufferLength;
@@ -247,14 +448,45 @@ id<MTLBuffer> allocState(const MetalContext &ctx, int n) {
     setError("a %d-qubit statevector needs %.2f GiB, but this GPU's "
              "maxBufferLength is %.2f GiB",
              n, gib(bytes), gib(limit));
-    return nil;
+    return false;
   }
-  id<MTLBuffer> buf = [ctx.device newBufferWithLength:bytes
-                                              options:MTLResourceStorageModeShared];
+  return true;
+}
+
+// A buffer for a 2^n statevector, or nil with gLastError set. Its contents
+// are undefined (it may be a reused one): callers zero it (zeroState) or
+// overwrite all of it (msv_grow_to).
+id<MTLBuffer> allocState(const MetalContext &ctx, int n) {
+  if (!checkQubits(ctx, n))
+    return nil;
+  const size_t bytes = sizeof(C2) << n;
+  if (!bufferCacheEnabled()) {
+    releaseIdleBuffers(); // left over from before it was disabled
+  } else if (bytes >= kMinCachedBytes) {
+    if (id<MTLBuffer> buf = statePool().take(bytes))
+      return buf;
+    const size_t budget = ctx.device.recommendedMaxWorkingSetSize;
+    statePool().trim(budget > bytes ? budget - bytes : 0);
+  }
+  ++gStateAllocations;
+  id<MTLBuffer> buf = newSharedBuffer(ctx, bytes);
   if (!buf)
     setError("could not allocate %.2f GiB for a %d-qubit statevector",
              gib(bytes), n);
   return buf;
+}
+
+// Scratch of at least `bytes` (a reused one may be larger), or nil.
+id<MTLBuffer> takeScratch(const MetalContext &ctx, size_t bytes) {
+  if (bufferCacheEnabled())
+    if (id<MTLBuffer> buf = scratchPool().take(bytes))
+      return buf;
+  return newSharedBuffer(ctx, bytes);
+}
+
+void giveScratch(id<MTLBuffer> buf) {
+  if (bufferCacheEnabled())
+    scratchPool().give(buf);
 }
 
 NSUInteger threadsPerGroup(id<MTLComputePipelineState> pso, NSUInteger grid) {
@@ -355,8 +587,11 @@ MSVState *msv_create(int nQubits) {
 void msv_destroy(MSVState *s) {
   if (!s) return;
   @autoreleasepool {
-    s->flush();
-    delete s; // ARC releases the buffer
+    // flush() waits for the GPU, so the buffer is idle before it is kept for
+    // reuse; after a GPU error it is not reused.
+    if (s->flush() && s->psi.length >= kMinCachedBytes && bufferCacheEnabled())
+      statePool().give(s->psi);
+    delete s; // ARC releases the buffer unless the pool kept it
   }
 }
 
@@ -452,6 +687,130 @@ int msv_grow_to(MSVState *s, int newNQubits) {
 void *msv_data(MSVState *s) {
   if (!s) return nullptr;
   @autoreleasepool { return s->flush() ? s->psi.contents : nullptr; }
+}
+
+int msv_pauli_expectations(MSVState *s, const unsigned *xmask,
+                           const unsigned *zmask, size_t nTerms, double *out) {
+  if (!s) return -1;
+  if (nTerms == 0) return 0;
+  const unsigned outside = ~(unsigned)(s->dim - 1); // dim <= 2^31
+  for (size_t t = 0; t < nTerms; ++t)
+    if ((xmask[t] | zmask[t]) & outside) {
+      setError("Pauli term %zu acts on a qubit outside the %d-qubit state", t,
+               s->nQubits);
+      return -1;
+    }
+  @autoreleasepool {
+    if (!s->flush()) return -1; // pending gates first
+    const MetalContext &ctx = *s->ctx;
+    id<MTLComputePipelineState> pso = ctx.psoPauli;
+
+    // Terms, padded to whole batches with (0, 0) = <psi|psi> (ignored).
+    const size_t nBatches = (nTerms + kPauliBatch - 1) / kPauliBatch;
+    std::vector<unsigned> packed(nBatches * kPauliBatch * 4, 0u);
+    for (size_t t = 0; t < nTerms; ++t) {
+      packed[4 * t] = xmask[t];
+      packed[4 * t + 1] = zmask[t];
+      packed[4 * t + 2] = __builtin_popcount(xmask[t] & zmask[t]) & 1u;
+    }
+
+    // Geometry: enough threads to fill the GPU, each summing up to 64
+    // amplitudes so the fp32 partials stay short.
+    const NSUInteger W = pso.threadExecutionWidth;
+    NSUInteger tg = pso.maxTotalThreadsPerThreadgroup < 256
+                        ? pso.maxTotalThreadsPerThreadgroup : 256;
+    tg -= tg % W;
+    size_t perThread = s->dim >> 15;
+    perThread = perThread < 1 ? 1 : (perThread > 64 ? 64 : perThread);
+    const size_t threads = (s->dim + perThread - 1) / perThread;
+    const size_t numTG = (threads + tg - 1) / tg;
+    const size_t slots = numTG * (tg / W);
+
+    // One partial per (batch, simdgroup, term); bound the buffer so huge
+    // states with many terms run in several dispatches instead.
+    // MSV_PAULI_SCRATCH_BYTES lowers the bound so tests reach that path.
+    const size_t bytesPerBatch = slots * kPauliBatch * sizeof(float);
+    size_t maxPartialBytes = size_t(64) << 20;
+    if (const char *e = std::getenv("MSV_PAULI_SCRATCH_BYTES"))
+      if (const long long v = std::atoll(e); v > 0)
+        maxPartialBytes = (size_t)v;
+    size_t chunk = maxPartialBytes / bytesPerBatch;
+    chunk = chunk < 1 ? 1 : (chunk > nBatches ? nBatches : chunk);
+
+    // One scratch buffer: the packed terms, then (256-byte aligned) the
+    // partials. Reused across calls (see BufferPool); every byte read is
+    // written first, so a reused buffer's old contents do not matter.
+    const size_t termBytes = packed.size() * sizeof(unsigned);
+    const size_t partialOffset = (termBytes + 255) & ~size_t(255);
+    const size_t scratchBytes = partialOffset + chunk * bytesPerBatch;
+    id<MTLBuffer> scratch = takeScratch(ctx, scratchBytes);
+    if (!scratch) {
+      setError("could not allocate %.2f GiB of expectation-value scratch",
+               gib(scratchBytes));
+      return -1;
+    }
+    std::memcpy(scratch.contents, packed.data(), termBytes);
+
+    for (size_t first = 0; first < nBatches; first += chunk) {
+      const size_t nb = nBatches - first < chunk ? nBatches - first : chunk;
+      const PauliParams prm{(unsigned)s->dim, (unsigned)perThread,
+                            (unsigned)slots, (unsigned)first};
+      id<MTLComputeCommandEncoder> enc = s->encoderFor(pso);
+      [enc setBuffer:scratch offset:0 atIndex:1];
+      [enc setBuffer:scratch offset:partialOffset atIndex:2];
+      [enc setBytes:&prm length:sizeof(prm) atIndex:3];
+      [enc dispatchThreadgroups:MTLSizeMake(numTG, nb, 1)
+          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+      if (!s->flush()) return -1;
+
+      // Sum each term's partials in double, then apply Re(i^nY * S): the
+      // kernel produced Re S (nY even) or Im S (nY odd).
+      const float *P =
+          (const float *)((const char *)scratch.contents + partialOffset);
+      dispatch_apply(nb * kPauliBatch, DISPATCH_APPLY_AUTO, ^(size_t i) {
+        const size_t b = i / kPauliBatch, t = i % kPauliBatch;
+        const size_t term = (first + b) * kPauliBatch + t;
+        if (term >= nTerms) return;
+        const float *col = P + b * slots * kPauliBatch + t;
+        double sum = 0.0;
+        for (size_t g = 0; g < slots; ++g)
+          sum += col[g * kPauliBatch];
+        const unsigned nY = __builtin_popcount(xmask[term] & zmask[term]) & 3u;
+        out[term] = (nY == 1u || nY == 2u) ? -sum : sum;
+      });
+    }
+    giveScratch(scratch);
+  }
+  return 0;
+}
+
+int msv_check_qubits(int nQubits) {
+  @autoreleasepool {
+    const MetalContext &ctx = context();
+    if (!ctx.error.empty()) {
+      setError("%s", ctx.error.c_str());
+      return -1;
+    }
+    return checkQubits(ctx, nQubits) ? 0 : -1;
+  }
+}
+
+int msv_env_flag(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v)
+    return 0;
+  for (const char *off : {"", "0", "false", "no", "off"})
+    if (strcasecmp(v, off) == 0)
+      return 0;
+  return 1;
+}
+
+void msv_buffer_stats(unsigned long long *stateAllocations,
+                      unsigned long long *stateReuses,
+                      unsigned long long *scratchReuses) {
+  if (stateAllocations) *stateAllocations = gStateAllocations;
+  if (stateReuses) *stateReuses = statePool().hits();
+  if (scratchReuses) *scratchReuses = scratchPool().hits();
 }
 
 int msv_num_qubits(const MSVState *s) { return s ? s->nQubits : 0; }

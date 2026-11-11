@@ -9,10 +9,12 @@
  * Metal engine uses, so — unlike the QPP backend — no index conversion is
  * needed and growing the state by a qubit is a plain low-half copy.
  *
- * Sampling, expectation values and single-qubit measurement run on the host,
- * on all cores, directly over the unified-memory amplitude buffer; because the
- * buffer is shared, collapsing the state in place is immediately visible to
- * subsequent GPU gates.
+ * Shot-free observe evaluates the whole Hamiltonian in one batched pass, on
+ * the GPU for large states (pauli_expect kernel) and on the host for small
+ * ones. Sampling and single-qubit measurement run on the host, on all cores,
+ * directly over the unified-memory amplitude buffer; because the buffer is
+ * shared, collapsing the state in place is immediately visible to subsequent
+ * GPU gates.
  *
  * Errors raised while a JIT-compiled kernel frame is on the stack go through
  * deferOrThrowKernelException: on macOS arm64 a C++ throw cannot unwind
@@ -78,6 +80,38 @@ void forEachChunk(std::size_t n, const Fn &fn) {
     const std::size_t b = c * kChunk;
     fn(c, b, std::min(b + kChunk, n));
   });
+}
+
+// Host twin of msv_pauli_expectations (same masks, same unnormalized
+// result), in double. Used for states too small to be worth a GPU round trip.
+void hostPauliExpectations(const Complex *amp, std::size_t dim,
+                           const std::vector<unsigned> &xs,
+                           const std::vector<unsigned> &zs, double *out) {
+  const std::size_t T = xs.size(), nc = numChunks(dim);
+  std::vector<double> part(nc * T);
+  forEachChunk(dim, [&](std::size_t c, std::size_t b, std::size_t e) {
+    for (std::size_t t = 0; t < T; ++t) {
+      const std::size_t x = xs[t], z = zs[t];
+      const bool imag = std::popcount(xs[t] & zs[t]) & 1;
+      double s = 0.0;
+      for (std::size_t i = b; i < e; ++i) {
+        // amp[i] * conj(amp[i ^ x]), real or imaginary part.
+        const Complex a = amp[i], o = amp[i ^ x];
+        const double v =
+            imag ? double(a.imag()) * o.real() - double(a.real()) * o.imag()
+                 : double(a.real()) * o.real() + double(a.imag()) * o.imag();
+        s += (std::popcount(i & z) & 1) ? -v : v;
+      }
+      part[c * T + t] = s;
+    }
+  });
+  for (std::size_t t = 0; t < T; ++t) {
+    double s = 0.0;
+    for (std::size_t c = 0; c < nc; ++c)
+      s += part[c * T + t];
+    const unsigned nY = std::popcount(xs[t] & zs[t]) & 3u; // Re(i^nY * s)
+    out[t] = (nY == 1 || nY == 2) ? -s : s;
+  }
 }
 
 } // namespace
@@ -206,19 +240,39 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
     return ok;
   }
 
-  // Synchronize and return the host view of the amplitudes, or nullptr (after
-  // reporting the error) if there is no state or the GPU failed.
-  Complex *amplitudes() {
-    if (!engine)
-      return nullptr;
+  // Qubits are allocated lazily. CUDA-Q hands over a constant-size register
+  // (`cudaq.qvector(20)`, the builder's `qalloc(20)`, so every Classiq kernel)
+  // one qubit at a time; building the engine eagerly would regrow it, with a
+  // fresh buffer and a copy, once per qubit on every call. Instead the engine
+  // is built at the allocated size the first time the state is needed: when a
+  // gate is applied or the state is read. Qubits it does not have yet are |0>,
+  // which is what a fresh allocation is, and gates queued before an allocation
+  // act only on earlier qubits, so they commute with it. Returns false if there
+  // are no qubits, or after reporting the error if the engine failed.
+  bool materialize() {
+    const int n = numQubitsFromDim();
+    if (engine && msv_num_qubits(engine) == n)
+      return true;
+    return n > 0 && ensureEngine(n);
+  }
+
+  // Synchronize and return the host view of the engine's amplitudes, or
+  // nullptr (after reporting the error) if the GPU failed. Needs an engine.
+  Complex *engineData() {
     if (void *p = msv_data(engine))
       return static_cast<Complex *>(p);
     fail(msv_last_error());
     return nullptr;
   }
 
+  // The full state's amplitudes (building the engine if needed), or nullptr
+  // if there are no qubits or it failed (after reporting the error).
+  Complex *amplitudes() { return materialize() ? engineData() : nullptr; }
+
   void applyMatrix(const Complex *mat, const std::vector<int> &targets,
                    const std::vector<int> &controls) {
+    if (!materialize())
+      throw std::runtime_error(std::string("[metal] ") + msv_last_error());
     if (msv_apply(engine, asFloats(mat), static_cast<int>(targets.size()),
                   targets.data(), controls.data(),
                   static_cast<int>(controls.size())) != 0)
@@ -228,21 +282,42 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
   // Initialize the qubits just allocated from `data` (2^k amplitudes): the
   // result is |data> ⊗ |current>, the new qubits being the high-order bits.
   void appendState(const Complex *data, std::size_t size) {
-    const int oldN = msv_num_qubits(engine), newN = numQubitsFromDim();
-    if (newN <= oldN || size != (std::size_t(1) << (newN - oldN))) {
+    const int newN = numQubitsFromDim();
+    const int k = std::has_single_bit(size) ? std::countr_zero(size) : 0;
+    if (k < 1 || k > newN) {
       fail("initial state has " + std::to_string(size) +
-           " amplitudes, expected 2^" + std::to_string(newN - oldN));
+           " amplitudes, expected 2^k for 1 <= k <= " + std::to_string(newN));
       return;
     }
-    if (!ensureEngine(newN))
+    const int oldN = newN - k;
+    if (engine && msv_num_qubits(engine) > oldN) {
+      // The engine already holds qubits this block claims; rebuilding it
+      // would silently discard them.
+      fail("initial state has " + std::to_string(size) + " amplitudes, but " +
+           std::to_string(newN - msv_num_qubits(engine)) +
+           " qubits were just allocated");
       return;
-    Complex *amp = amplitudes();
+    }
+    if (!engine) {
+      // Every earlier qubit is still |0> (allocated lazily, or none), so
+      // block j of the new state is data[j] |0...0>: one zeroed engine plus
+      // 2^k writes, no copy.
+      if (!ensureEngine(newN))
+        return;
+      Complex *amp = engineData();
+      if (!amp)
+        return;
+      for (std::size_t j = 0; j < size; ++j)
+        amp[j << oldN] = data[j];
+      return;
+    }
+    // Build the remaining lazily allocated qubits below the block first, so
+    // the block lands above them.
+    if (!ensureEngine(oldN) || !ensureEngine(newN))
+      return;
+    Complex *amp = engineData();
     if (!amp)
       return;
-    if (oldN == 0) {
-      std::memcpy(amp, data, size * sizeof(Complex));
-      return;
-    }
     // Block j of the new state is data[j] * old. Block 0 holds the old state,
     // so it is rewritten last.
     const std::size_t oldDim = std::size_t(1) << oldN;
@@ -278,7 +353,7 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
   std::vector<int> loneTargets_, loneControls_;
   std::vector<int> scratchTargets_, scratchControls_;
   // Set MSV_DISABLE_FUSION=1 to bypass fusion (for A/B benchmarking).
-  const bool fuseEnabled_ = (std::getenv("MSV_DISABLE_FUSION") == nullptr);
+  const bool fuseEnabled_ = !msv_env_flag("MSV_DISABLE_FUSION");
 
   static int posIn(const std::vector<int> &v, int q) {
     return int(std::lower_bound(v.begin(), v.end(), q) - v.begin());
@@ -414,6 +489,48 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
             op);
   }
 
+  // Below this many amplitude-term products a host pass beats the GPU round
+  // trip (commit + wait) that a batched GPU evaluation costs. Measured on an
+  // M5 Pro: host wins up to 2^18, the GPU from 2^19 (either way by < 0.3 ms
+  // near the crossover).
+  static constexpr std::size_t kGpuExpectationWork = std::size_t(1) << 19;
+
+  // MSV_OBSERVE_DEVICE=gpu|host forces where expectation values are computed
+  // (for tests and A/B benchmarks); anything else means "pick by size".
+  static bool useGpuForExpectations(std::size_t dim, std::size_t terms) {
+    if (const char *d = std::getenv("MSV_OBSERVE_DEVICE")) {
+      if (std::strcmp(d, "gpu") == 0)
+        return true;
+      if (std::strcmp(d, "host") == 0)
+        return false;
+    }
+    return dim * terms >= kGpuExpectationWork;
+  }
+
+  // out[t] = <psi|P_t|psi> (unnormalized) for Pauli strings given as qubit
+  // masks (see msv_pauli_expectations). Returns false after reporting an
+  // error.
+  bool pauliExpectations(const std::vector<unsigned> &xs,
+                         const std::vector<unsigned> &zs,
+                         std::vector<double> &out) {
+    out.assign(xs.size(), 0.0);
+    // The engine as it is: the masks only name qubits it has (observe treats
+    // the rest as |0>), so there is no need to build lazily allocated ones.
+    Complex *amp = engineData(); // synchronizes the GPU
+    if (!amp)
+      return false;
+    const std::size_t dim = engineDim();
+    if (!useGpuForExpectations(dim, xs.size())) {
+      hostPauliExpectations(amp, dim, xs, zs, out.data());
+      return true;
+    }
+    if (msv_pauli_expectations(engine, xs.data(), zs.data(), xs.size(),
+                               out.data()) == 0)
+      return true;
+    fail(msv_last_error());
+    return false;
+  }
+
 protected:
   void addQubitToState() override { addQubitsToState(1); }
 
@@ -426,8 +543,11 @@ protected:
     if (stateDataIn)
       appendState(static_cast<const Complex *>(stateDataIn),
                   std::size_t(1) << qubitCount);
-    else
-      ensureEngine(numQubitsFromDim());
+    // Otherwise the new qubits stay |0> until the engine is built or grown
+    // (materialize), but a size this device cannot hold is still reported
+    // here, at the allocation, rather than at the first gate or read.
+    else if (msv_check_qubits(numQubitsFromDim()) != 0)
+      fail(msv_last_error());
   }
 
   /// @brief Allocate qubits initialized from an existing state (e.g. one
@@ -506,11 +626,10 @@ protected:
   /// @brief Reset the current state back to |0...0>.
   void setToZeroState() override {
     discardGroup();
-    const int n = numQubitsFromDim();
-    if (n == 0)
+    if (numQubitsFromDim() == 0)
       deallocateStateImpl();
-    else if (ensureEngine(n))
-      msv_reset(engine);
+    else if (engine)
+      msv_reset(engine); // qubits not built yet are |0> already
   }
 
   /// @brief Measure a single qubit, collapsing the state.
@@ -683,6 +802,96 @@ public:
     }
     counts.expectationValue = expVal;
     return counts;
+  }
+
+  /// @brief Take over shot-free observe: CUDA-Q then hands us the whole
+  /// Hamiltonian (observe() below) instead of looping over its terms with a
+  /// basis change and a full host pass per term. Shot-based observe keeps
+  /// that term-by-term sampling, as it needs real samples per term, and
+  /// CUDAQ_OBSERVE_FROM_SAMPLING=1 restores it for shot-free observe too.
+  bool canHandleObserve() override {
+    const auto *ctx = cudaq::getExecutionContext();
+    if (ctx && ctx->shots > 0 && ctx->shots != static_cast<std::size_t>(-1))
+      return false;
+    return !shouldObserveFromSampling(/*defaultConfig=*/false);
+  }
+
+  /// @brief <psi|H|psi> for the whole Hamiltonian: every term in one batched
+  /// pass (GPU for large states, host for small), no basis-change gates.
+  /// Results match the term-by-term path: each term is normalized by
+  /// <psi|psi> (so fp32 norm drift does not bias it), identity terms add
+  /// their coefficient without a per-term entry, and a qubit the state does
+  /// not have counts as |0> (Z -> +1, X/Y -> 0).
+  cudaq::observe_result observe(const cudaq::spin_op &H) override {
+    checkNotSilentlyDeferred("observe");
+    flushGateQueue();
+    const std::size_t n = engine ? msv_num_qubits(engine) : 0;
+
+    constexpr std::ptrdiff_t kIdentity = -1, kZero = -2;
+    struct Term {
+      double coef;
+      std::string id;
+      std::ptrdiff_t slot; // index into xs/zs, or kIdentity / kZero
+    };
+    std::vector<Term> terms;
+    terms.reserve(H.num_terms());
+    std::vector<unsigned> xs{0u}, zs{0u}; // slot 0 = <psi|psi>
+    for (const auto &term : H) {
+      const double coef = term.evaluate_coefficient().real();
+      if (term.is_identity()) {
+        terms.push_back({coef, {}, kIdentity});
+        continue;
+      }
+      unsigned x = 0, z = 0;
+      bool zero = false;
+      for (const auto &p : term) {
+        const auto pauli = p.as_pauli();
+        if (pauli == cudaq::pauli::I)
+          continue;
+        const std::size_t q = p.target();
+        if (q >= n) { // not in the state, i.e. |0>
+          zero |= pauli != cudaq::pauli::Z;
+          continue;
+        }
+        if (pauli != cudaq::pauli::Z)
+          x |= 1u << q; // X or Y
+        if (pauli != cudaq::pauli::X)
+          z |= 1u << q; // Z or Y
+      }
+      std::ptrdiff_t slot = kZero;
+      if (!zero) {
+        slot = static_cast<std::ptrdiff_t>(xs.size());
+        xs.push_back(x);
+        zs.push_back(z);
+      }
+      terms.push_back({coef, term.get_term_id(), slot});
+    }
+
+    std::vector<double> vals;
+    if (!engine)
+      vals.assign(xs.size(), 1.0); // no qubits: every surviving term is I
+    else if (!pauliExpectations(xs, zs, vals))
+      return {};
+    const double norm = vals[0];
+    if (!(norm > 0.0)) {
+      fail("cannot compute expectation values of a zero-norm state.");
+      return {};
+    }
+
+    double sum = 0.0;
+    std::vector<cudaq::ExecutionResult> results;
+    results.reserve(terms.size());
+    for (auto &t : terms) {
+      if (t.slot == kIdentity) {
+        sum += t.coef;
+        continue;
+      }
+      // (+ 0.0 turns the -0.0 a negated zero sum would give into 0.0.)
+      const double e = t.slot == kZero ? 0.0 : vals[t.slot] / norm + 0.0;
+      results.emplace_back(cudaq::CountsDictionary{}, std::move(t.id), e);
+      sum += t.coef * e;
+    }
+    return cudaq::observe_result(sum, H, cudaq::sample_result(sum, results));
   }
 
   /// @brief Expose the current statevector for cudaq::get_state() etc.
