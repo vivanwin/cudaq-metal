@@ -20,8 +20,13 @@ GPU with `cudaq.set_target("metal")`. No new API, no code restructuring.
 
 ```bash
 pip install cudaq==0.16.0
-pip install git+https://github.com/vivanwin/cudaq-metal.git
+pip install https://github.com/vivanwin/cudaq-metal/releases/download/v0.4.0/cudaq_metal-0.4.0-py3-none-macosx_13_0_arm64.whl
 ```
+
+That installs the wheel attached to the
+[0.4.0 release](https://github.com/vivanwin/cudaq-metal/releases/tag/v0.4.0).
+To try unreleased changes on `main` instead, use
+`pip install git+https://github.com/vivanwin/cudaq-metal.git`.
 
 - **Apple Silicon Mac (arm64), macOS 13 or newer** — the same floor as the
   cudaq wheels. The wheel is tagged `macosx_13_0_arm64`, so pip refuses it on
@@ -207,6 +212,11 @@ plugin against the wheel's own libraries, copies it into `cudaq_metal/data/`
 and writes the wheel to `dist/`. For a new CUDA-Q minor version also bump
 `COMPATIBLE_CUDAQ` in `cudaq_metal/_install.py` and the `cuda-quantum-cu13`
 pin in `pyproject.toml`.
+
+To release, bump `version` in `pyproject.toml` before building, attach the
+wheel from `dist/` to a GitHub release for the new tag, and update the wheel
+URL under [Install](#install) and in the setup cell of
+`examples/qaoa_maxcut/qaoa_maxcut.ipynb`.
 
 To develop against the checkout, install it editable — the next
 `import cudaq_metal` copies a freshly refreshed dylib into cudaq — and run the
