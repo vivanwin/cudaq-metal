@@ -472,9 +472,9 @@ class MetalCircuitSimulator : public nvqir::CircuitSimulatorBase<float> {
   // `flushGateQueueImpl` are no-ops, so the kernel's gates are never applied.
   // CUDA-Q 0.16 re-raises the stashed error when the kernel returns; on
   // CUDA-Q <= 0.15 on Darwin arm64 it often did not, and sampling silently
-  // returned the untouched |0..0> state (see BUG_INVESTIGATION.md). We warn so
-  // a regression is loud. It only warns: it does not throw, inspect or clear
-  // the stashed exception — all three crashed in the 0.15 failure mode.
+  // returned the untouched |0..0> state. We warn so a regression is loud. It
+  // only warns: it does not throw, inspect or clear the stashed exception —
+  // all three crashed in the 0.15 failure mode.
   static void checkNotSilentlyDeferred(const char *op) {
     if (!kernelExecutionDeferred())
       return;
