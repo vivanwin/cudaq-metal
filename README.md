@@ -149,31 +149,46 @@ The benchmark runs the `brickwork_classiq.py` circuit — synthesized by
 Classiq and converted with `qprog_to_cudaq_kernel` — on CUDA-Q's CPU
 simulator (`qpp-cpu`) and on `metal`, timing one
 `cudaq.observe(kernel, Σ Zᵢ)` per point; synthesis and kernel construction
-happen before the clock starts. Apple M5 Pro (24 GB), CUDA-Q 0.16.0, median
-of at least 5 runs (fast points repeat until they add up to 0.5 s):
+happen before the clock starts. Five layers (the example's default, ~12 gates
+per qubit) is a small circuit, so the benchmark also runs it at 50 layers
+(~120 gates per qubit). Apple M5 Pro (24 GB), CUDA-Q 0.16.0, median of at
+least 5 runs (fast points repeat until they add up to 0.5 s):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="benchmarks/results/examples-dark.png">
-  <img alt="Time per cudaq.observe() vs qubit count for a Classiq circuit: qpp-cpu doubles per qubit to about 2 s at 17 qubits; metal stays near 0.5–1.0 ms up to 17 qubits, about 1,960 times faster there, and reaches 30 qubits in about 14 s." src="benchmarks/results/examples.png">
+  <img alt="Time per cudaq.observe() vs qubit count for a Classiq circuit at 5 layers (solid lines) and 50 layers (dashed). qpp-cpu doubles per qubit, reaching about 2 s at 17 qubits with 5 layers and 20 s with 50. metal stays between 0.5 and 5 ms up to 17 qubits, about 1,960 times faster there at 5 layers and 3,870 times at 50, and reaches 30 qubits in about 14 s and 141 s." src="benchmarks/results/examples.png">
 </picture>
 
 - **qpp-cpu** doubles per qubit, as a CPU statevector does: ~2 s per observe
-  at n=17.
-- **metal** stays at ~0.5–1.0 ms up to n=17, where the fixed per-call cost
-  dominates, and ~6 ms at n=20. From there it doubles per qubit as memory
-  bandwidth takes over: ~0.37 s at n=25 (256 MB statevector).
-- **At n=17, metal is ~1,960× faster** (2.03 s → 1.04 ms). Metal's
-  millisecond-scale times are sensitive to run-to-run noise; earlier runs of
-  this benchmark measured 550–1,900×.
-- Metal reaches **n=30** (an 8 GiB statevector) in ~14 s per observe;
-  extrapolating qpp-cpu's doubling puts it at several hours.
-- At 8 qubits there is little to win: ~1.2 ms vs ~0.5 ms.
+  at n=17 with 5 layers, ~20 s with 50. Ten times the gates cost ten times
+  the time.
+- **metal** stays in the milliseconds up to n=17: 0.5–1.0 ms at 5 layers,
+  where the fixed per-call cost dominates, and 1.5–5 ms at 50. From n≈20 it
+  doubles per qubit as memory bandwidth takes over, and 50 layers cost ~10×
+  as much as 5: 0.37 s vs 3.6 s at n=25 (256 MB statevector).
+- **At n=17, metal is ~1,960× faster at 5 layers** (2.03 s → 1.04 ms) **and
+  ~3,870× at 50** (20.0 s → 5.2 ms): a deeper circuit spreads metal's fixed
+  cost over more gates. Metal's millisecond-scale times are sensitive to
+  run-to-run noise; earlier runs of the 5-layer benchmark measured
+  550–1,900×.
+- Metal reaches **n=30** (an 8 GiB statevector) in ~14 s per observe at 5
+  layers and ~141 s at 50; extrapolating qpp-cpu's doubling puts it at ~5
+  hours and ~2 days.
+- At 8 qubits there is little to win at 5 layers (~1.2 ms vs ~0.5 ms); at 50
+  layers it is 9.2 ms vs 1.5 ms.
 
 The frontend doesn't change these numbers: the same gates written as a
 native `@cudaq.kernel` (`brickwork_native.py`) simulate at the same speed.
+A bigger Hamiltonian widens the gap further. With those native gates at 16
+qubits and 5 layers, replacing Σ Zᵢ with 1,000 random Pauli terms of weight
+≤ 4 took qpp-cpu from 0.9 s to 19 s and metal from 0.9 ms to 3.5 ms
+(~5,400×): metal evaluates the terms in batched GPU passes, qpp-cpu one at a
+time.
 
 Reproduce with (needs `classiq.authenticate()` once, plus matplotlib for the
-plot):
+plot). The full sweep takes about an hour, mostly the 50-layer points at
+26–30 qubits; target names and `--depth` limit it to those runs and keep the
+other rows (e.g. `examples_scaling_bench.py metal --depth 5`):
 
 ```bash
 python benchmarks/examples_scaling_bench.py
@@ -241,7 +256,7 @@ Empirically on an **Apple M5 Pro (24 GB unified)**:
 
 - `maxBufferLength` = **14.30 GB** (13.32 GiB)
 - `recommendedMaxWorkingSetSize` = 19.07 GB (advisory)
-- **n=30 → 8.6 GB buffer → OK** (~14 s per observe, verified on-machine)
+- **n=30 → 8.6 GB buffer → OK** (~14 s per observe at 5 layers, verified on-machine)
 - **n=31 → 17.2 GB buffer → fails** with
   `a 31-qubit statevector needs 16.00 GiB, but this GPU's maxBufferLength is 13.32 GiB`
 
@@ -250,15 +265,15 @@ So **n=30 is the ceiling on a 24 GB M5 Pro**; n=31 needs a Mac whose
 Going past 31 qubits needs a redesigned engine (64-bit indexing and a
 statevector split across multiple buffers).
 
-The timing curve stays log-linear right up to the wall (the metal line of
+The timing curve stays log-linear right up to the wall (the metal lines of
 the benchmark above):
 
-| n | statevector | observe |
-|---|---|---|
-| 25 | 256 MB | 0.37 s |
-| 27 | 1 GB | 1.6 s |
-| 29 | 4 GB | 6.9 s |
-| 30 | 8 GB | 14.1 s |
+| n | statevector | observe, 5 layers | observe, 50 layers |
+|---|---|---|---|
+| 25 | 256 MB | 0.37 s | 3.6 s |
+| 27 | 1 GB | 1.6 s | 15.4 s |
+| 29 | 4 GB | 6.9 s | 67 s |
+| 30 | 8 GB | 14.1 s | 141 s |
 
 ## Limitations, honestly
 
